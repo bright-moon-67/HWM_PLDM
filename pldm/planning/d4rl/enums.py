@@ -39,6 +39,14 @@ class ExecRepairConfig(ConfigBase):
 
     # Step 4: project the high-level subgoal onto low-level reachable states.
     repair_enabled: bool = False
+    # How many extra L2 plans to sample when the repair branch fires. Each
+    # candidate costs one extra L2 plan plus one extra L1 plan.
+    high_resample_count: int = 2
+    # Accept a repaired macro action only if it lowers the cross-level gap by
+    # more than this amount.
+    repair_min_improvement: float = 0.0
+    # Re-raise exceptions from the experimental repair branch (debugging only).
+    repair_raise_errors: bool = False
 
     # Step 5/6: re-rank high-level candidates with low-level feedback.
     high_feedback_enabled: bool = False

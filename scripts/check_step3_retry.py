@@ -821,6 +821,105 @@ def _with_flags(cfg):
     return cfg
 
 
+class FakeLevelPlanner:
+    """Planner stub with the attributes the repair branch snapshots/restores."""
+
+    def __init__(self, n_envs: int = 2):
+        self.ctrls = [FakeCtrl(torch.ones(2, 2)) for _ in range(n_envs)]
+        self.last_plan_size = 2
+        self.calls = 0
+        self.target = None
+
+    def reset_targets(self, targets, repr_input: bool = True):
+        self.target = targets
+
+    def plan(self, **kwargs):
+        self.calls += 1
+        return make_result(float(self.calls))
+
+
+class FakeHierarchy:
+    def __init__(self, n_envs: int = 2):
+        self.l1_planner = FakeLevelPlanner(n_envs)
+        self.l2_planner = FakeLevelPlanner(n_envs)
+
+
+@case
+def v17_high_level_reselection_picks_reachable_candidate():
+    from pldm.planning.subgoal_repair import (
+        plan_with_high_level_reselection,
+        should_repair,
+    )
+
+    # Trigger gating.
+    assert not bool(
+        should_repair(cross_mse=torch.tensor([0.5]), gap_threshold=0.0, subgoal_index=1).any()
+    )
+    assert bool(
+        should_repair(cross_mse=torch.tensor([0.5]), gap_threshold=0.2, subgoal_index=1)[0]
+    )
+
+    hierarchy = FakeHierarchy()
+    first_l1 = make_result(0.0)
+    first_l2 = make_result(0.0)
+    candidate_gaps = [torch.tensor([0.30, 0.40]), torch.tensor([0.05, 0.45])]
+    calls = {"n": 0}
+
+    def metrics_fn(_l1, _l2):
+        value = candidate_gaps[calls["n"]]
+        calls["n"] += 1
+        return {"cross_mse": value}
+
+    cfg = RetryCfg(threshold=0.2, require_path_cost=False)
+    cfg.repair_enabled = True
+    cfg.high_resample_count = 2
+    cfg.repair_min_improvement = 0.0
+
+    merged_l1, merged_l2, info = plan_with_high_level_reselection(
+        h_planner=hierarchy,
+        l2_plan_kwargs={},
+        l1_plan_kwargs={},
+        l1_first_result=first_l1,
+        l1_first_metrics={"cross_mse": torch.tensor([0.50, 0.50])},
+        l2_first_result=first_l2,
+        metrics_fn=metrics_fn,
+        cfg=cfg,
+        subgoal_index=1,
+    )
+
+    assert hierarchy.l2_planner.calls == 2
+    assert hierarchy.l1_planner.calls == 2
+    assert info is not None and info.n_triggered == 2 and info.n_accepted == 2
+    # env 0: candidate 2 (gap 0.05) beats candidate 1 (0.30)
+    # env 1: candidate 1 (0.40) beats candidate 2 (0.45)
+    assert torch.all(merged_l1.pred_obs[:, 0] == 2.0)
+    assert torch.all(merged_l1.pred_obs[:, 1] == 1.0)
+    assert torch.all(merged_l2.pred_obs[:, 0] == 2.0)
+    assert torch.all(merged_l2.pred_obs[:, 1] == 1.0)
+    assert info.selected_candidate.tolist() == [2, 1]
+    assert torch.allclose(info.gap_selected, torch.tensor([0.05, 0.40]))
+
+    # No trigger -> untouched results and no extra planning.
+    quiet = FakeHierarchy()
+    cfg_quiet = RetryCfg(threshold=5.0, require_path_cost=False)
+    cfg_quiet.repair_enabled = True
+    cfg_quiet.high_resample_count = 2
+    cfg_quiet.repair_min_improvement = 0.0
+    out_l1, out_l2, info_quiet = plan_with_high_level_reselection(
+        h_planner=quiet,
+        l2_plan_kwargs={},
+        l1_plan_kwargs={},
+        l1_first_result=first_l1,
+        l1_first_metrics={"cross_mse": torch.tensor([0.50, 0.50])},
+        l2_first_result=first_l2,
+        metrics_fn=lambda *_: {"cross_mse": torch.tensor([0.0, 0.0])},
+        cfg=cfg_quiet,
+        subgoal_index=1,
+    )
+    assert quiet.l1_planner.calls == 0 and quiet.l2_planner.calls == 0
+    assert out_l1 is first_l1 and out_l2 is first_l2 and info_quiet is None
+
+
 def main() -> int:
     failures = []
     for fn in TESTS:

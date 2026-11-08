@@ -709,6 +709,19 @@ class MPCEvaluator(ABC):
                             )
                             planner.last_retry_info = None
 
+                    # Step 4/5: log the high-level re-search decision.
+                    if diagnostics is not None:
+                        repair_info = getattr(planner, "last_repair_info", None)
+                        if repair_info is not None:
+                            diagnostics.record(
+                                "repair",
+                                batch_size=len(envs),
+                                step=i,
+                                level="hier",
+                                metrics=repair_info.as_dict(),
+                            )
+                            planner.last_repair_info = None
+
                     # Step 1: cross-level gap of the first L1 plan.
                     if diagnostics is not None:
                         gap_metrics = getattr(planner, "last_diagnostics", None)

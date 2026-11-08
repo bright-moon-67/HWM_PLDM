@@ -197,7 +197,6 @@ eval_cfg:
       retry_enabled: false
       repair_enabled: false
       high_feedback_enabled: false
-      # Step 3: 低于等于 0 的阈值等于关闭重试（即使 retry_enabled=true）
       retry_gap_threshold: 0.0
       # cross_mse：按绝对跨层残差触发；pred_progress：按预测进展低于阈值触发
       retry_trigger_metric: cross_mse
@@ -213,6 +212,11 @@ eval_cfg:
       # P0: 每次 replan 前把 L1 MPPI 的名义轨迹前移 replan_every 步
       # （HWM 的 L1 计划长度恒定，原实现因此从不做 warm-start 移位）
       shift_l1_warm_start: false
+      # Step 4/5: 低层重试仍无法到达子目标时，重新搜索高层 macro-action，
+      # 按“低层可达性”为每个环境选择候选
+      high_resample_count: 2
+      repair_min_improvement: 0.0
+      repair_raise_errors: false
       subgoal_index: 1
       task_id_offset: 0
       output_dir: ""
