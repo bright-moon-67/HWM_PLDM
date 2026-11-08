@@ -216,6 +216,10 @@ def v1b_cross_level_metrics_shapes():
         "pred_dist_T",
         "pred_progress_h",
         "pred_progress_T",
+        "pred_dist_4",
+        "pred_progress_4",
+        "pred_dist_10",
+        "pred_progress_10",
         "progress_horizon",
     ):
         assert metrics[name].shape == (batch,), (name, metrics[name].shape)
@@ -235,6 +239,10 @@ def v1b_cross_level_metrics_shapes():
         "pred_dist_T",
         "pred_progress_h",
         "pred_progress_T",
+        "pred_dist_4",
+        "pred_progress_4",
+        "pred_dist_10",
+        "pred_progress_10",
         "progress_horizon",
     }
 

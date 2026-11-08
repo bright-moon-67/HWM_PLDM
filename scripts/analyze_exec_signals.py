@@ -38,6 +38,8 @@ METRICS: Dict[str, Tuple[str, str]] = {
     "cross_mse": ("plan_gap", "cross_mse"),
     "path_cost": ("plan_gap", "path_cost"),
     "pred_progress_h": ("plan_gap", "pred_progress_h"),
+    "pred_progress_4": ("plan_gap", "pred_progress_4"),
+    "pred_progress_10": ("plan_gap", "pred_progress_10"),
     "l2_subgoal_norm": ("plan_gap", "l2_subgoal_norm"),
     "exec_mse_obs": ("exec_error", "exec_mse_obs"),
     "real_progress_h": ("exec_error", "real_progress_h"),

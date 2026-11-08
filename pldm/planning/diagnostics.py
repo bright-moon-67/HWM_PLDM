@@ -346,7 +346,7 @@ def cross_level_metrics(
     d_T = (z_low - z_high).pow(2).mean(dim=1)
     denom = d0.clamp_min(1e-8)
 
-    return {
+    metrics = {
         "cross_mse": diff.pow(2).mean(dim=1).detach(),
         "cross_l2": torch.linalg.vector_norm(diff, dim=1).detach(),
         "l2_subgoal_norm": torch.linalg.vector_norm(z_high, dim=1).detach(),
@@ -362,6 +362,17 @@ def cross_level_metrics(
         ),
         "subgoal_l2": z_high.detach(),
     }
+
+    # Fixed short/long horizons so different runs can be compared without
+    # depending on the configured ``replan_every`` (clamped when the L1 horizon
+    # is shorter than the requested step).
+    for fixed_index in (4, 10):
+        index = min(max(fixed_index, 0), horizon - 1)
+        dist = (z_low_all[index] - z_high).pow(2).mean(dim=1)
+        metrics[f"pred_dist_{fixed_index}"] = dist.detach()
+        metrics[f"pred_progress_{fixed_index}"] = ((d0 - dist) / denom).detach()
+
+    return metrics
 
 
 def execution_prediction_index(
@@ -391,6 +402,10 @@ LOGGABLE_GAP_KEYS = (
     "pred_dist_T",
     "pred_progress_h",
     "pred_progress_T",
+    "pred_dist_4",
+    "pred_progress_4",
+    "pred_dist_10",
+    "pred_progress_10",
     "progress_horizon",
 )
 
