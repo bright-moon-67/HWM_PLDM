@@ -105,6 +105,11 @@ class TwoLvlPlanner:
         # In-process execution context (may contain large tensors such as the
         # projected subgoal). Never serialised to JSONL.
         self.last_exec_context = None
+        # Review 4 (B): limit repair oscillation.
+        self.repair_cooldown = None  # per-env replans left before the next repair
+        self.repair_count = None  # per-env number of repairs this episode
+        # Review 4 (4.3): previous repair target, to log goal jitter.
+        self.last_repair_goal = None
 
     def _subgoal_index(self) -> int:
         """High-level subgoal index. Fixed to 1 unless the master switch is on."""
@@ -349,6 +354,7 @@ class TwoLvlPlanner:
 
         mode = self.repair_mode
         trigger_mask = self._repair_trigger_mask(batch_size)
+        min_improvement = self._repair_min_improvement(batch_size)
 
         try:
             if self._projection_mode:
@@ -364,7 +370,9 @@ class TwoLvlPlanner:
                     cfg=self.exec_cfg,
                     subgoal_index=subgoal_index,
                     trigger_mask=trigger_mask,
+                    min_improvement=min_improvement,
                 )
+                self._note_repair_accepted(None if info is None else info.accepted)
                 return merged, l2_result, info
 
             merged_l1, merged_l2, info = plan_with_high_level_reselection(
@@ -379,7 +387,9 @@ class TwoLvlPlanner:
                 subgoal_index=subgoal_index,
                 lambda_vector=self._repair_lambda(batch_size),
                 trigger_mask=trigger_mask,
+                min_improvement=min_improvement,
             )
+            self._note_repair_accepted(None if info is None else info.accepted)
             return merged_l1, merged_l2, info
         except Exception:
             # The repair branch is experimental: a failure there must not take
@@ -389,6 +399,76 @@ class TwoLvlPlanner:
             return l1_result, l2_result, None
 
     def _repair_trigger_mask(self, batch_size: int):
+        """Extra per-environment gate for the repair branch (review 4).
+
+        Combines three independent constraints:
+
+        * ``repair_trigger_mode="stuck"``: only repair after ``stuck_windows``
+          consecutive windows in which the plan predicted motion and the robot
+          did not move - this is what keeps the branch away from trajectories
+          that are simply taking a detour;
+        * ``repair_cooldown_replans``: at least this many replans between two
+          repairs of the same environment;
+        * ``repair_max_per_episode``: hard budget per environment.
+
+        Plus the step-6 gate from :meth:`_feedback_trigger_mask`.
+        """
+        mask = self._feedback_trigger_mask(batch_size)
+        cfg = self.exec_cfg
+
+        mode = str(getattr(cfg, "repair_trigger_mode", "gap") or "gap").lower()
+        if mode == "stuck":
+            feedback = self.exec_feedback
+            if feedback is None:
+                stuck = torch.zeros(batch_size, dtype=torch.bool)
+            else:
+                stuck = feedback.stuck_mask(
+                    int(getattr(cfg, "stuck_windows", 2) or 2),
+                    n_envs=batch_size,
+                )
+                stuck = stuck.detach().cpu().to(dtype=torch.bool)
+            mask = stuck if mask is None else (mask.to(stuck.device) & stuck)
+
+        cooldown_replans = int(getattr(cfg, "repair_cooldown_replans", 0) or 0)
+        max_per_episode = int(getattr(cfg, "repair_max_per_episode", 0) or 0)
+        if cooldown_replans > 0 or max_per_episode > 0:
+            if self.repair_cooldown is None or self.repair_cooldown.numel() != batch_size:
+                self.repair_cooldown = torch.zeros(batch_size, dtype=torch.int32)
+                self.repair_count = torch.zeros(batch_size, dtype=torch.int32)
+            allowed = torch.ones(batch_size, dtype=torch.bool)
+            if cooldown_replans > 0:
+                allowed &= self.repair_cooldown <= 0
+            if max_per_episode > 0:
+                allowed &= self.repair_count < max_per_episode
+            mask = allowed if mask is None else (mask.to(allowed.device) & allowed)
+            # Every replan consumes one cooldown tick; accepted repairs reset it.
+            self.repair_cooldown = torch.clamp(
+                self.repair_cooldown - 1, min=0
+            ).to(dtype=torch.int32)
+
+        return mask
+
+    def _note_repair_accepted(self, accepted) -> None:
+        """Update cooldown / per-episode budget / goal-jitter bookkeeping."""
+        if accepted is None:
+            return
+        accepted = accepted.detach().cpu().to(dtype=torch.bool)
+        cooldown_replans = int(
+            getattr(self.exec_cfg, "repair_cooldown_replans", 0) or 0
+        )
+        if self.repair_cooldown is not None and self.repair_cooldown.numel() == accepted.numel():
+            if cooldown_replans > 0:
+                self.repair_cooldown = torch.where(
+                    accepted,
+                    torch.full_like(self.repair_cooldown, cooldown_replans),
+                    self.repair_cooldown,
+                )
+            if self.repair_count is not None:
+                self.repair_count = self.repair_count + accepted.to(
+                    dtype=self.repair_count.dtype
+                )
+
+    def _feedback_trigger_mask(self, batch_size: int):
         """Step 6 gate: repair only where the low-level model is unreliable.
 
         ``U_exec`` (recent execution error) is constant across the candidates of
@@ -404,7 +484,32 @@ class TwoLvlPlanner:
             return None
         trust = feedback.model_trust(n_envs=batch_size)
         threshold = float(getattr(self.exec_cfg, "feedback_trigger_threshold", 0.0))
-        return trust >= threshold
+        return (trust >= threshold).detach().cpu()
+
+    def _repair_min_improvement(self, batch_size: int):
+        """Acceptance margin, raised when recent prediction has been reliable.
+
+        Review 4 (C): a reliable high-level plan should not be replaced for a
+        marginal gap gain, while an unreliable one may be repaired aggressively.
+        """
+        base = float(getattr(self.exec_cfg, "repair_min_improvement", 0.0))
+        if not bool(getattr(self.exec_cfg, "repair_require_exec_failure", False)):
+            return base
+        feedback = self.exec_feedback
+        if feedback is None:
+            return base
+        trust = feedback.model_trust(n_envs=batch_size).detach().cpu()
+        reliable_threshold = float(
+            getattr(self.exec_cfg, "repair_reliable_trust", 0.05)
+        )
+        strict = float(
+            getattr(self.exec_cfg, "repair_reliable_min_improvement", base)
+        )
+        return torch.where(
+            trust < reliable_threshold,
+            torch.full_like(trust, strict),
+            torch.full_like(trust, base),
+        )
 
     def _repair_lambda(self, batch_size: int):
         """Ablation only: per-environment reachability weight, or ``None``.

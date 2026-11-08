@@ -24,6 +24,23 @@ from pldm.planning.exec_feedback import ExecutionFeedback
 from pldm.planning.warm_start import shift_low_level_warm_start
 
 
+def _start_xy_from_infos(infos):
+    """Real ``(B, 2)`` positions from a list of environment infos, or ``None``."""
+    if not infos:
+        return None
+    try:
+        return torch.from_numpy(
+            np.stack(
+                [
+                    np.asarray(info["location"], dtype=np.float32).reshape(-1)[:2]
+                    for info in infos
+                ]
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 class MPCEvaluator(ABC):
     def __init__(
         self,
@@ -315,6 +332,25 @@ class MPCEvaluator(ABC):
                 metrics["real_xy"] = real_xy
                 metrics["exec_mse_xy"] = diff_xy.pow(2).mean(dim=-1)
                 metrics["exec_l2_xy"] = torch.linalg.vector_norm(diff_xy, dim=-1)
+
+                # Stuck window (review 4, A): the plan predicted motion but the
+                # robot stayed put. Uses the real position at plan time, which is
+                # why ``pending_exec`` stores it.
+                start_xy = pending.get("start_xy")
+                if start_xy is not None and start_xy.shape == real_xy.shape:
+                    real_move = torch.linalg.vector_norm(real_xy - start_xy, dim=-1)
+                    pred_move = torch.linalg.vector_norm(pred_xy - start_xy, dim=-1)
+                    real_eps = float(
+                        getattr(self._exec_cfg(), "stuck_real_eps", 0.15) or 0.0
+                    )
+                    pred_eps = float(
+                        getattr(self._exec_cfg(), "stuck_pred_eps", 0.30) or 0.0
+                    )
+                    metrics["real_move"] = real_move
+                    metrics["pred_move"] = pred_move
+                    metrics["stuck_window"] = (
+                        (real_move < real_eps) & (pred_move > pred_eps)
+                    ).to(dtype=torch.float32)
 
         if diagnostics is not None:
             diagnostics.record(
@@ -690,6 +726,9 @@ class MPCEvaluator(ABC):
                             if initial_dist is not None and min_dist > 0.0:
                                 valid = valid & (initial_dist >= min_dist)
                             exec_feedback.update(errors, valid=valid)
+                        stuck = exec_metrics.get("stuck_window")
+                        if stuck is not None:
+                            exec_feedback.update_stuck(stuck > 0.5)
                     pending_exec = None
 
                 if bilevel_planning:
@@ -803,6 +842,11 @@ class MPCEvaluator(ABC):
                                     "pred_xy": pred_xy,
                                     "plan_step": i,
                                     "horizon": pred_index,
+                                    # Real position at plan time (last_infos is the
+                                    # state the current observation belongs to), so
+                                    # the realised/predicted displacements of this
+                                    # window use the same origin.
+                                    "start_xy": _start_xy_from_infos(last_infos),
                                     "subgoal_l2": _cpu(
                                         exec_context.get("subgoal_l2")
                                     ),

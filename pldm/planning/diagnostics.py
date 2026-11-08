@@ -106,6 +106,8 @@ class DiagnosticsRecorder:
             and (
                 getattr(cfg, "log_diagnostics", False)
                 or getattr(cfg, "retry_enabled", False)
+                # A repair-only run still needs its events recorded.
+                or getattr(cfg, "repair_enabled", False)
             )
         )
 

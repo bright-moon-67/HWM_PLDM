@@ -77,6 +77,30 @@ class ExecRepairConfig(ConfigBase):
     # separate from ``retry_gap_threshold`` so E2 (retry) and E3/E4 (repair) use
     # their own budgets; 0 falls back to ``retry_gap_threshold``.
     repair_gap_threshold: float = 0.0
+
+    # ---- Review 4: repair only after a confirmed execution failure ----
+    # "gap"   -> fire whenever cross_mse > repair_gap_threshold (E3 behaviour)
+    # "stuck" -> fire only when the low level predicted motion and the robot did
+    #            not move for ``stuck_windows`` consecutive windows
+    repair_trigger_mode: str = "gap"
+    # A window is "stuck" when the realised displacement is below
+    # ``stuck_real_eps`` while the predicted displacement exceeded
+    # ``stuck_pred_eps`` (both in metres per replan window).
+    stuck_real_eps: float = 0.15
+    stuck_pred_eps: float = 0.30
+    stuck_windows: int = 2
+    # Never fire twice within this many replans, and at most this many times per
+    # episode. Both limit the "repair oscillation" seen on the regressed tasks.
+    repair_cooldown_replans: int = 0
+    repair_max_per_episode: int = 0
+    # Only accept a repair when recent prediction has been unreliable; a
+    # reliable high-level plan is not overridden for a marginal gap gain.
+    repair_require_exec_failure: bool = False
+    repair_reliable_trust: float = 0.05
+    repair_reliable_min_improvement: float = 0.02
+    # Debug: compute repairs but drop them (must reproduce the baseline exactly;
+    # used to verify RNG/warm-start isolation).
+    repair_force_reject: bool = False
     # ... and does not make the cross-level gap worse by more than this.
     repair_gap_tolerance: float = 0.0
     # Re-raise exceptions from the experimental repair branch (debugging only).

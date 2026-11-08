@@ -58,6 +58,8 @@ class ExecutionFeedback:
         self.device = device
         self.error_ema: Optional[torch.Tensor] = None
         self.initialized: Optional[torch.Tensor] = None
+        # Consecutive "predicted motion did not happen" windows (review 4, A).
+        self.stuck_streak: Optional[torch.Tensor] = None
         self.updates = 0
         if n_envs is not None:
             self.reset(n_envs)
@@ -88,18 +90,30 @@ class ExecutionFeedback:
     def reset(self, n_envs: int) -> None:
         self.error_ema = torch.zeros(int(n_envs), dtype=torch.float32)
         self.initialized = torch.zeros(int(n_envs), dtype=torch.bool)
+        self.stuck_streak = torch.zeros(int(n_envs), dtype=torch.int32)
         if self.device is not None:
             self.error_ema = self.error_ema.to(self.device)
             self.initialized = self.initialized.to(self.device)
+            self.stuck_streak = self.stuck_streak.to(self.device)
         self.updates = 0
+
+    def _current_size(self, n_envs: Optional[int]) -> int:
+        """Resolve the batch size without reallocating when it is unspecified."""
+        if n_envs is not None:
+            return int(n_envs)
+        if self.error_ema is not None:
+            return int(self.error_ema.numel())
+        return 1
 
     def _ensure(self, batch_size: int, device=None) -> torch.Tensor:
         if self.error_ema is None or self.error_ema.numel() != batch_size:
             self.error_ema = torch.zeros(batch_size, dtype=torch.float32)
             self.initialized = torch.zeros(batch_size, dtype=torch.bool)
+            self.stuck_streak = torch.zeros(batch_size, dtype=torch.int32)
         if device is not None and self.error_ema.device != device:
             self.error_ema = self.error_ema.to(device)
             self.initialized = self.initialized.to(device)
+            self.stuck_streak = self.stuck_streak.to(device)
         return self.error_ema
 
     # ----------------------------------------------------------------- update
@@ -167,11 +181,7 @@ class ExecutionFeedback:
         feedback to decide *when* to repair, not how much to trust ``C_feas``.
         """
         if n_envs is None:
-            n_envs = (
-                self.error_ema.numel()
-                if self.error_ema is not None
-                else 1
-            )
+            n_envs = self._current_size(None)
         ema = self._ensure(int(n_envs), device=device)
         weight = float(base_weight) * (1.0 + self.kappa * ema)
         return weight.clamp(self.lambda_min, self.lambda_max)
@@ -184,10 +194,49 @@ class ExecutionFeedback:
         across the candidates of one environment, so it can gate *whether* to
         repair but cannot re-rank candidates by itself.
         """
-        ema = self._ensure(
-            int(n_envs) if n_envs is not None else 1, device=device
-        )
+        ema = self._ensure(self._current_size(n_envs), device=device)
         return ema / (1.0 + ema)
+
+    # ------------------------------------------------------------- stuck state
+    def update_stuck(
+        self,
+        flags: Optional[torch.Tensor],
+        *,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Update the per-environment count of consecutive stuck windows.
+
+        ``flags`` is ``(B,)`` bool: the plan predicted motion but the robot did
+        not move (review 4, improvement A). ``mask`` marks environments whose
+        window was actually evaluated this step; an unevaluated window leaves
+        the streak unchanged instead of resetting it.
+        """
+        if flags is None:
+            return self.stuck_streak
+        flags = flags.detach().to(dtype=torch.bool)
+        self._ensure(flags.numel(), device=flags.device)
+        streak = self.stuck_streak.to(device=flags.device)
+        if mask is None:
+            mask = torch.ones_like(flags)
+        else:
+            mask = mask.to(device=flags.device, dtype=torch.bool)
+        streak = torch.where(mask & flags, streak + 1, streak)
+        streak = torch.where(mask & ~flags, torch.zeros_like(streak), streak)
+        self.stuck_streak = streak
+        return streak
+
+    def stuck_mask(
+        self,
+        windows: int,
+        n_envs: Optional[int] = None,
+        device=None,
+    ) -> torch.Tensor:
+        """Environments whose last ``windows`` executed windows were all stuck."""
+        self._ensure(self._current_size(n_envs), device=device)
+        streak = self.stuck_streak
+        if device is not None:
+            streak = streak.to(device)
+        return streak >= int(windows)
 
     @property
     def mean_error(self) -> float:

@@ -131,15 +131,55 @@ def _stack_steps(history: Any, n_envs: int) -> Optional[List[List[Optional[float
     return columns
 
 
+def _real_final_dist(result: Any, n_envs: int) -> List[Optional[float]]:
+    """Distance between the robot's last real position and the goal.
+
+    ``locations`` holds one ``(n_envs, 2)`` entry per environment step, i.e. the
+    positions actually reported by the environment, while ``targets`` is the
+    ``(n_envs, 2)`` goal. ``final_preds_dist`` (kept as ``final_dist``) is the
+    world model's *prediction* and must not be reported as navigation accuracy.
+    """
+    locations = _field(result, "locations")
+    targets = _field(result, "targets")
+    out: List[Optional[float]] = [None] * n_envs
+    if locations is None or targets is None:
+        return out
+    try:
+        last = locations[-1]
+    except (IndexError, TypeError):
+        return out
+    last = (
+        last.detach().cpu()
+        if isinstance(last, torch.Tensor)
+        else torch.as_tensor(last)
+    )
+    tgt = (
+        targets.detach().cpu()
+        if isinstance(targets, torch.Tensor)
+        else torch.as_tensor(targets)
+    )
+    if last.dim() != 2 or tgt.dim() != 2 or last.shape[0] != n_envs:
+        return out
+    diff = (last[:, :2] - tgt[:, :2]).pow(2).sum(dim=1).sqrt()
+    return [float(v) for v in diff.tolist()]
+
+
 def _episode_stats(result: Any, n_envs: int) -> Dict[str, List[Any]]:
-    """Per-environment episode return, final distance and first success step."""
+    """Per-environment episode return, final distance and first success step.
+
+    ``final_preds_dist`` is the **world-model** prediction distance, not where the
+    robot actually ended up, so the real number is derived separately from
+    ``locations`` (one entry per environment step) and ``targets``.
+    """
     rewards = _stack_steps(_field(result, "reward_history"), n_envs)
     success = _stack_steps(_field(result, "success_history"), n_envs)
     dists = _stack_steps(_field(result, "final_preds_dist"), n_envs)
+    real_dist = _real_final_dist(result, n_envs)
 
     out: Dict[str, List[Any]] = {
         "return": [None] * n_envs,
         "final_dist": [None] * n_envs,
+        "real_final_dist": real_dist,
         "success_step": [None] * n_envs,
         "episode_len": [None] * n_envs,
     }
@@ -284,7 +324,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if maps is not None and local_idx < len(maps):
                 record["map_hash"] = _map_hash(maps[local_idx])
             if episode_stats is not None:
-                for key in ("return", "final_dist", "success_step", "episode_len"):
+                for key in (
+                    "return",
+                    "final_dist",
+                    "real_final_dist",
+                    "success_step",
+                    "episode_len",
+                ):
                     record[key] = episode_stats[key][local_idx]
             if starts is not None and local_idx < len(starts):
                 record["start"] = [float(x) for x in list(starts[local_idx])[:2]]
@@ -329,6 +375,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _mean_of([r["return"] for r in records if r["success"] and r.get("return") is not None])
         ),
         "mean_final_dist": _mean("final_dist"),
+        # Real navigation accuracy, from the recorded robot positions.
+        "mean_real_final_dist": _mean("real_final_dist"),
         "success_by_200": sum(
             1
             for r in records

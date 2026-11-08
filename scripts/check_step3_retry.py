@@ -1356,6 +1356,122 @@ def v25_feasibility_gate_and_baseline_normalisation():
     assert scores.shape == (3, 1)
 
 
+@case
+def v26_stuck_trigger_cooldown_and_budget():
+    from pldm.planning.exec_feedback import ExecutionFeedback
+
+    fb = ExecutionFeedback(n_envs=2)
+    fb.update_stuck(torch.tensor([True, False]))
+    assert fb.stuck_mask(1).tolist() == [True, False]
+    assert fb.stuck_mask(2).tolist() == [False, False]
+    fb.update_stuck(torch.tensor([True, True]))
+    assert fb.stuck_mask(2).tolist() == [True, False]
+    fb.update_stuck(torch.tensor([False, False]))
+    assert fb.stuck_mask(1).tolist() == [False, False]
+
+    cfg = RetryCfg(threshold=0.2, require_path_cost=False)
+    cfg.enabled = True
+    cfg.repair_enabled = True
+    cfg.repair_mode = "projection"
+    cfg.repair_top_k = 4
+    cfg.repair_trigger_mode = "stuck"
+    cfg.stuck_windows = 2
+    cfg.repair_cooldown_replans = 2
+    cfg.repair_max_per_episode = 3
+
+    fb2 = ExecutionFeedback(n_envs=2)
+    fb2.update_stuck(torch.tensor([True, True]))
+    fb2.update_stuck(torch.tensor([True, False]))
+    planner = TwoLvlPlanner(None, None, 10, exec_cfg=cfg, exec_feedback=fb2)
+
+    mask = planner._repair_trigger_mask(2)
+    assert mask.tolist() == [True, False], mask
+
+    # An accepted repair starts the cooldown and consumes one budget slot.
+    planner._note_repair_accepted(torch.tensor([True, False]))
+    assert planner.repair_cooldown.tolist() == [2, 0]
+    assert planner.repair_count.tolist() == [1, 0]
+    assert planner._repair_trigger_mask(2).tolist() == [False, False]
+
+    # Cooldown ticks down with every replan; the budget caps the episode.
+    planner._repair_trigger_mask(2)
+    planner._repair_trigger_mask(2)
+    assert planner.repair_cooldown.tolist() == [0, 0]
+    assert planner._repair_trigger_mask(2).tolist() == [True, False]
+    planner._note_repair_accepted(torch.tensor([True, False]))
+    planner._note_repair_accepted(torch.tensor([True, False]))
+    planner.repair_cooldown = torch.zeros(2, dtype=torch.int32)
+    assert planner.repair_count.tolist() == [3, 0]
+    assert planner._repair_trigger_mask(2).tolist() == [False, False]
+
+
+@case
+def v27_force_reject_and_reliability_acceptance():
+    from pldm.planning import subgoal_repair
+
+    hierarchy = FakeHierarchy(n_envs=1)
+    selection = subgoal_repair.ReachableSelection(
+        subgoal_l2=torch.zeros(1, 12),
+        subgoal_l2_map=torch.zeros(1, 3, 2, 2),
+        index=torch.tensor([1]),
+        valid=torch.tensor([True]),
+        dist=torch.zeros(1, 1),
+        progress=torch.zeros(1, 1),
+    )
+    saved = (
+        subgoal_repair.build_reachable_candidates,
+        subgoal_repair.select_reachable_subgoal,
+    )
+    subgoal_repair.build_reachable_candidates = lambda *a, **k: (
+        subgoal_repair.ReachableCandidates(
+            states=torch.zeros(1, 1, 3, 2, 2),
+            actions=torch.zeros(1, 1, 4, 2),
+            costs=torch.zeros(1, 1),
+        )
+    )
+    subgoal_repair.select_reachable_subgoal = lambda *a, **k: selection
+    try:
+        cfg = RetryCfg(threshold=0.2, require_path_cost=False)
+        cfg.repair_enabled = True
+        cfg.repair_top_k = 2
+        cfg.repair_force_reject = True
+        merged, info = subgoal_repair.plan_with_reachable_projection(
+            h_planner=hierarchy,
+            backbone_output=torch.zeros(1, 3, 2, 2),
+            l1_plan_kwargs={"plan_size": 4},
+            l1_first_result=make_result(0.0, batch=1),
+            l1_first_metrics={"cross_mse": torch.tensor([0.50])},
+            l2_result=make_result(0.0, batch=1),
+            metrics_fn=lambda *_: {"cross_mse": torch.tensor([0.10])},
+            objective=FakeObjective(FakeEncoder(False), None),
+            cfg=cfg,
+            subgoal_index=1,
+        )
+        assert info is not None and info.n_accepted == 0
+        assert torch.all(merged.pred_obs == 0.0)  # original plan kept
+    finally:
+        (
+            subgoal_repair.build_reachable_candidates,
+            subgoal_repair.select_reachable_subgoal,
+        ) = saved
+
+    # Reliability-dependent margin: strict when the model is reliable.
+    from pldm.planning.exec_feedback import ExecutionFeedback
+
+    fb = ExecutionFeedback(n_envs=2)
+    fb.update(torch.tensor([0.0, 5.0]))  # trust 0.0 vs 0.83
+    cfg2 = RetryCfg(threshold=0.2, require_path_cost=False)
+    cfg2.enabled = True
+    cfg2.repair_enabled = True
+    cfg2.repair_require_exec_failure = True
+    cfg2.repair_reliable_trust = 0.05
+    cfg2.repair_min_improvement = 0.0
+    cfg2.repair_reliable_min_improvement = 0.5
+    planner = TwoLvlPlanner(None, None, 10, exec_cfg=cfg2, exec_feedback=fb)
+    margin = planner._repair_min_improvement(2)
+    assert margin.tolist() == [0.5, 0.0], margin
+
+
 def main() -> int:
     failures = []
     for fn in TESTS:

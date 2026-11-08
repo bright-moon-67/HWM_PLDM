@@ -92,6 +92,9 @@ class RepairInfo:
     # degenerate search), which makes extra resampling pointless.
     candidate_gap_spread: Optional[torch.Tensor] = None
     candidate_jh_spread: Optional[torch.Tensor] = None
+    # Distance between this repair target and the previous one (review 4, 4.3):
+    # large values on consecutive repairs mean the subgoal is oscillating.
+    subgoal_shift: Optional[torch.Tensor] = None
 
     @property
     def n_triggered(self) -> int:
@@ -124,6 +127,7 @@ class RepairInfo:
             "reachable_valid",
             "candidate_gap_spread",
             "candidate_jh_spread",
+            "subgoal_shift",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -634,6 +638,16 @@ def _metric_or_none(metrics: Dict[str, Any], key: str) -> Optional[torch.Tensor]
     return value.detach() if torch.is_tensor(value) else None
 
 
+def _as_tensor(value: Any, like: torch.Tensor) -> torch.Tensor:
+    """Broadcast a scalar or tensor acceptance margin to ``like``'s shape."""
+    if torch.is_tensor(value):
+        tensor = value.detach().to(device=like.device, dtype=like.dtype).view(-1)
+        if tensor.numel() == 1:
+            return tensor.expand_as(like)
+        return tensor
+    return torch.full_like(like, float(value))
+
+
 def _feasibility_mask(
     progress: List[Optional[torch.Tensor]],
     gaps: torch.Tensor,
@@ -682,6 +696,7 @@ def plan_with_reachable_projection(
     cfg: Any,
     subgoal_index: int = 1,
     trigger_mask: Optional[torch.Tensor] = None,
+    min_improvement: Any = None,
 ) -> Tuple[PlanningResult, Optional[RepairInfo]]:
     """Step 4: project the high-level subgoal onto low-level reachable states.
 
@@ -718,7 +733,11 @@ def plan_with_reachable_projection(
     if top_k <= 0:
         return l1_first_result, None
 
-    min_improvement = float(getattr(cfg, "repair_min_improvement", 0.0))
+    min_improvement = (
+        _as_tensor(min_improvement, gap_before)
+        if min_improvement is not None
+        else torch.full_like(gap_before, float(getattr(cfg, "repair_min_improvement", 0.0)))
+    )
     original_subgoal = l2_result.pred_obs[subgoal_index].detach()
     snapshot = snapshot_low_level_state(h_planner.l1_planner)
 
@@ -745,7 +764,14 @@ def plan_with_reachable_projection(
             return l1_first_result, None
 
         h_planner.l1_planner.reset_targets(selection.subgoal_l2_map, repr_input=True)
-        repaired_result = h_planner.l1_planner.plan(**l1_plan_kwargs)
+        # Review 4, P0-1: the extra MPPI call must not consume the episode's
+        # random stream, otherwise even a fully rejected repair changes every
+        # later plan.
+        self_rng_devices = (
+            [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        )
+        with torch.random.fork_rng(devices=self_rng_devices, enabled=True):
+            repaired_result = h_planner.l1_planner.plan(**l1_plan_kwargs)
         repaired_metrics = metrics_fn(repaired_result, l2_result)
         wall_time_s = time.time() - start
     except Exception:
@@ -763,15 +789,38 @@ def plan_with_reachable_projection(
             pass
 
     repaired_gap = repaired_metrics["cross_mse"].detach()
+    # Goal jitter: how far is this repair target from the previous one?
+    subgoal_shift = None
+    previous_goal = getattr(h_planner, "last_repair_goal", None)
+    if previous_goal is not None and previous_goal.shape == selection.subgoal_l2.shape:
+        subgoal_shift = (
+            (selection.subgoal_l2.detach() - previous_goal.to(selection.subgoal_l2.device))
+            .pow(2)
+            .mean(dim=1)
+        )
+    selected_mask = selection.valid.to(dtype=torch.bool)
+    if subgoal_shift is not None and bool(selected_mask.any()):
+        updated = selection.subgoal_l2.detach().clone()
+        if previous_goal is not None and previous_goal.shape == updated.shape:
+            updated[~selected_mask] = previous_goal.to(updated.device)[~selected_mask]
+        h_planner.last_repair_goal = updated
+    elif bool(selected_mask.any()):
+        h_planner.last_repair_goal = selection.subgoal_l2.detach().clone()
+
     # Only environments that actually found a reachable candidate may accept a
     # repaired plan; the batch-level ``valid.any()`` check above is not enough
     # because some environments can lack an admissible candidate.
+    improvement = gap_before - repaired_gap
     accepted = (
         triggered
         & selection.valid.to(device=repaired_gap.device, dtype=torch.bool)
         & torch.isfinite(repaired_gap)
-        & ((gap_before - repaired_gap) > min_improvement)
+        & (improvement > min_improvement)
     )
+    if bool(getattr(cfg, "repair_force_reject", False)):
+        # Validation mode: compute the repair but never use it. The resulting run
+        # must be identical to the baseline if isolation is correct.
+        accepted = torch.zeros_like(accepted)
     accepted = accepted.to(dtype=torch.bool)
 
     if bool(accepted.any()):
@@ -794,6 +843,7 @@ def plan_with_reachable_projection(
         wall_time_s=wall_time_s,
         mode="projection",
         reachable_valid=selection.valid,
+        subgoal_shift=subgoal_shift,
     )
 
 

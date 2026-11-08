@@ -231,6 +231,21 @@ eval_cfg:
       repair_min_improvement: 0.0
       repair_gap_tolerance: 0.0
       repair_raise_errors: false
+      # ---- review-4: 只在确认执行失败后修复 ----
+      # gap = 旧行为（cross_mse 超阈值即修复）；stuck = 连续 stuck_windows 个窗口
+      # “模型预测有位移但真实没动”才修复
+      repair_trigger_mode: gap
+      stuck_real_eps: 0.15
+      stuck_pred_eps: 0.30
+      stuck_windows: 2
+      repair_cooldown_replans: 0
+      repair_max_per_episode: 0
+      # 仅在预测不可靠时接受修复；可靠时不因微小 gap 改善而改动原计划
+      repair_require_exec_failure: false
+      repair_reliable_trust: 0.05
+      repair_reliable_min_improvement: 0.02
+      # 调试：算出修复但一律不接受，用于校验随机性/热启动隔离
+      repair_force_reject: false
       # Step 6: lambda_t = clip(lambda_0 * (1 + kappa * EMA(exec_error)))
       exec_feedback_enabled: false
       feedback_beta: 0.1
