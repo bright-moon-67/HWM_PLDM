@@ -87,6 +87,19 @@ def _stats(values: List[float]) -> Optional[Dict[str, float]]:
     }
 
 
+def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+    n = len(xs)
+    if n < 3 or len(ys) != n:
+        return None
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n
+    sx = (sum((x - mx) ** 2 for x in xs) / n) ** 0.5
+    sy = (sum((y - my) ** 2 for y in ys) / n) ** 0.5
+    if sx == 0.0 or sy == 0.0:
+        return None
+    return float(cov / (sx * sy))
+
+
 def _pair(task_ids: List[int], values: Any) -> Iterable[tuple]:
     floats = _as_list(values)
     for index, task_id in enumerate(task_ids):
@@ -99,6 +112,8 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
     selected_gaps: Dict[int, List[float]] = defaultdict(list)
     path_costs: Dict[int, List[float]] = defaultdict(list)
     exec_errors: Dict[int, List[float]] = defaultdict(list)
+    gap_series: Dict[int, Dict[int, float]] = defaultdict(dict)
+    exec_series: Dict[int, Dict[int, float]] = defaultdict(dict)
     events: Dict[str, int] = defaultdict(int)
     retries: List[Dict[str, Any]] = []
 
@@ -110,6 +125,7 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
         if event == "plan_gap":
             for task_id, value in _pair(task_ids, record.get("cross_mse")):
                 gaps[task_id].append(value)
+                gap_series[task_id][int(record.get("step", -1))] = value
             for task_id, value in _pair(task_ids, record.get("path_cost")):
                 path_costs[task_id].append(value)
             for task_id, value in _pair(task_ids, record.get("gap_selected")):
@@ -118,6 +134,8 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
         elif event == "exec_error":
             for task_id, value in _pair(task_ids, record.get("exec_mse_xy")):
                 exec_errors[task_id].append(value)
+            for task_id, value in _pair(task_ids, record.get("exec_mse_obs")):
+                exec_series[task_id][int(record.get("plan_step", -1))] = value
 
         elif event == "retry":
             retries.append(record)
@@ -133,6 +151,19 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
         selected = selected_gaps.get(task_id, [])
         if selected:
             entry["gap_selected"] = _stats(selected)
+
+        aligned = [
+            (gap_series[task_id][step], value)
+            for step, value in sorted(exec_series.get(task_id, {}).items())
+            if step in gap_series.get(task_id, {})
+        ]
+        if aligned:
+            entry["corr_cross_exec"] = {
+                "n": len(aligned),
+                "pearson": _pearson(
+                    [pair[0] for pair in aligned], [pair[1] for pair in aligned]
+                ),
+            }
         tasks[str(task_id)] = entry
 
     retry_summary = {
@@ -198,6 +229,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if entry.get("gap_selected"):
             parts.append(
                 "gap_selected mean={:.5f}".format(entry["gap_selected"]["mean"])
+            )
+        if entry.get("corr_cross_exec") and entry["corr_cross_exec"]["pearson"] is not None:
+            parts.append(
+                "corr(cross_t, exec_t+4)={:.3f} (n={})".format(
+                    entry["corr_cross_exec"]["pearson"],
+                    entry["corr_cross_exec"]["n"],
+                )
             )
         label = labels.get(int(task_id))
         prefix = f"task {task_id}"
