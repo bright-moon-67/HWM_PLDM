@@ -1,6 +1,9 @@
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, TYPE_CHECKING
 from .planner import Planner, PlanningResult
 import torch
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from pldm.planning.d4rl.enums import ExecRepairConfig
 
 
 class TwoLvlPlanningResult(NamedTuple):
@@ -14,10 +17,23 @@ class TwoLvlPlanner:
         l1_planner: Planner,
         l2_planner: Planner,
         l2_step_skip: int,
+        exec_cfg: Optional["ExecRepairConfig"] = None,
+        chunk_offset: int = 0,
     ):
         self.l1_planner = l1_planner
         self.l2_planner = l2_planner
         self.l2_step_skip = l2_step_skip
+        # Research switches (pldm.planning.d4rl.enums.ExecRepairConfig).
+        # Step 0 keeps them inert: with every switch off, plan() below is
+        # byte-for-byte identical to the baseline implementation.
+        self.exec_cfg = exec_cfg
+        self.chunk_offset = int(chunk_offset)
+
+    @property
+    def task_id_offset(self) -> int:
+        """Global task id offset for this chunk (shard offset + chunk offset)."""
+        shard_offset = getattr(self.exec_cfg, "task_id_offset", 0) or 0
+        return int(shard_offset) + self.chunk_offset
 
     def reset_targets(self, targets: torch.Tensor, repr_input: bool = True):
         self.l2_planner.reset_targets(targets, repr_input=repr_input)

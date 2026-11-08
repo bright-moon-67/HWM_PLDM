@@ -62,7 +62,7 @@ class MPCEvaluator(ABC):
 
         return chunk_sizes
 
-    def _construct_h_planner(self, n_envs: int):
+    def _construct_h_planner(self, n_envs: int, chunk_offset: int = 0):
         l1_planner = self._construct_planner(n_envs=n_envs, l1_to_l2=True)
 
         l2_planner = self._construct_planner(
@@ -74,6 +74,11 @@ class MPCEvaluator(ABC):
             l1_planner=l1_planner,
             l2_planner=l2_planner,
             l2_step_skip=self.model.config.step_skip,
+            # NOTE: hierarchical planners are rebuilt per chunk inside
+            # _perform_mpc_in_chunks, so research state must live on the
+            # planner (or config), never on the evaluator.
+            exec_cfg=getattr(self.config, "exec_repair", None),
+            chunk_offset=chunk_offset,
         )
 
         return h_planner
@@ -169,7 +174,10 @@ class MPCEvaluator(ABC):
             planner = self._construct_planner(n_envs=chunk_size)
 
             if self.hierarchical:
-                h_planner = self._construct_h_planner(n_envs=chunk_size)
+                h_planner = self._construct_h_planner(
+                    n_envs=chunk_size,
+                    chunk_offset=chunk_offset,
+                )
                 mpc_result = self._perform_h_mpc(
                     h_planner=h_planner,
                     planner=planner,

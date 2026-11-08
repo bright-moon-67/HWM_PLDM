@@ -7,6 +7,8 @@ checkpoint/
 *.ipynb_checkpoints/
 *.npz
 *.db
+# experiment artifacts (regenerate with scripts/collect_hwm_results.py)
+results/
 scripts/submit_multiple_jobs.py
 pldm/pretrained/
 pldm_envs/diverse_maze/datasets
