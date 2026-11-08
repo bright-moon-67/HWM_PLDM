@@ -112,6 +112,7 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
     selected_gaps: Dict[int, List[float]] = defaultdict(list)
     path_costs: Dict[int, List[float]] = defaultdict(list)
     exec_errors: Dict[int, List[float]] = defaultdict(list)
+    exec_obs_errors: Dict[int, List[float]] = defaultdict(list)
     gap_series: Dict[int, Dict[int, float]] = defaultdict(dict)
     exec_series: Dict[int, Dict[int, float]] = defaultdict(dict)
     events: Dict[str, int] = defaultdict(int)
@@ -135,6 +136,8 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
             for task_id, value in _pair(task_ids, record.get("exec_mse_xy")):
                 exec_errors[task_id].append(value)
             for task_id, value in _pair(task_ids, record.get("exec_mse_obs")):
+                exec_obs_errors[task_id].append(value)
+            for task_id, value in _pair(task_ids, record.get("exec_mse_obs")):
                 exec_series[task_id][int(record.get("plan_step", -1))] = value
 
         elif event == "retry":
@@ -146,6 +149,7 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
         entry = {
             "cross_mse": _stats(gaps.get(task_id, [])),
             "path_cost": _stats(path_costs.get(task_id, [])),
+            "exec_mse_obs": _stats(exec_obs_errors.get(task_id, [])),
             "exec_mse_xy": _stats(exec_errors.get(task_id, [])),
         }
         selected = selected_gaps.get(task_id, [])
@@ -220,10 +224,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     entry["cross_mse"]["max"],
                 )
             )
+        if entry["exec_mse_obs"]:
+            parts.append(
+                "exec_mse_obs mean={:.5f} max={:.5f}".format(
+                    entry["exec_mse_obs"]["mean"], entry["exec_mse_obs"]["max"]
+                )
+            )
         if entry["exec_mse_xy"]:
             parts.append(
-                "exec_mse_xy mean={:.5f} max={:.5f}".format(
-                    entry["exec_mse_xy"]["mean"], entry["exec_mse_xy"]["max"]
+                "exec_mse_xy(prober) mean={:.3f}".format(
+                    entry["exec_mse_xy"]["mean"]
                 )
             )
         if entry.get("gap_selected"):
