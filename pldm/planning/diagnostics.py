@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from pldm.models.utils import flatten_conv_output
+
 ScalarLike = Union[int, float, bool, torch.Tensor]
 
 
@@ -99,7 +101,11 @@ class DiagnosticsRecorder:
         if cfg is None:
             return False
         return bool(
-            getattr(cfg, "enabled", False) and getattr(cfg, "log_diagnostics", False)
+            getattr(cfg, "enabled", False)
+            and (
+                getattr(cfg, "log_diagnostics", False)
+                or getattr(cfg, "retry_enabled", False)
+            )
         )
 
     @property
@@ -179,3 +185,121 @@ class DiagnosticsRecorder:
             f"path={self.path}, task_id_offset={self.task_id_offset}, "
             f"chunk_offset={self.chunk_offset})"
         )
+
+
+def project_l1_encoding_to_l2(encodings: torch.Tensor, objective: Any) -> torch.Tensor:
+    """Project fused level-1 encodings into the level-2 representation.
+
+    This mirrors the representation mapping used by ``RunningCost.__call__`` in
+    ``pldm/planning/planners/mppi_planner.py``. Reusing that exact mapping is
+    important: the low-level MPC objective already compares L1 predictions
+    against the L2 subgoal this way, so diagnostics must not invent a different
+    projection.
+
+    ``objective`` is a ``ReprTargetMPCObjective`` whose ``model`` is the level-1
+    model and whose ``pred_encoder`` is the level-2 backbone.
+
+    Accepts a single step ``(B, C, H, W)`` or a full prediction
+    ``(T, B, C, H, W)`` and returns ``(B, D)`` / ``(T, B, D)``.
+    """
+    if not torch.is_tensor(encodings):
+        raise TypeError(f"encodings must be a tensor, got {type(encodings)}")
+
+    pred_encoder = getattr(objective, "pred_encoder", None)
+    if pred_encoder is None:
+        return flatten_conv_output(encodings)
+
+    if encodings.dim() == 5:
+        t, b = encodings.shape[0], encodings.shape[1]
+        flat = encodings.reshape(t * b, *encodings.shape[2:])
+    elif encodings.dim() == 4:
+        t, b = None, None
+        flat = encodings
+    else:
+        raise ValueError(
+            f"expected a 4D or 5D encoding tensor, got {tuple(encodings.shape)}"
+        )
+
+    if bool(getattr(pred_encoder, "using_proprio", False)):
+        backbone = objective.model.backbone
+        obs_dim_info = getattr(backbone, "output_obs_dim", None)
+        proprio_dim_info = getattr(backbone, "output_proprio_dim", None)
+        if obs_dim_info is None or proprio_dim_info is None:
+            raise RuntimeError(
+                "cannot split fused L1 encodings: backbone is missing "
+                "output_obs_dim/output_proprio_dim"
+            )
+        obs_channels = (
+            obs_dim_info[0] if isinstance(obs_dim_info, tuple) else int(obs_dim_info)
+        )
+        proprio_channels = (
+            proprio_dim_info[0]
+            if isinstance(proprio_dim_info, tuple)
+            else int(proprio_dim_info)
+        )
+        if obs_channels <= 0 or proprio_channels <= 0:
+            raise RuntimeError(
+                "cannot split fused L1 encodings: "
+                f"output_obs_dim={obs_dim_info}, "
+                f"output_proprio_dim={proprio_dim_info}"
+            )
+        obs_state = flat[:, :obs_channels]
+        proprio_state = flat[:, obs_channels : obs_channels + proprio_channels]
+        projected = pred_encoder(obs_state, proprio=proprio_state).encodings
+    else:
+        projected = pred_encoder(flat).encodings
+
+    projected = flatten_conv_output(projected)
+    if t is not None:
+        projected = projected.view(t, b, *projected.shape[1:])
+    return projected
+
+
+def cross_level_metrics(
+    l1_pred_obs: torch.Tensor,
+    l2_pred_obs: torch.Tensor,
+    objective: Any,
+    *,
+    subgoal_index: int = 1,
+) -> Dict[str, torch.Tensor]:
+    """Cross-level prediction disagreement for one planning decision.
+
+    ``pred_obs`` tensors include the current timestep at index 0 (the MPC
+    objective drops it via ``encodings[1:]``), so ``subgoal_index=1`` compares
+    the L2 subgoal one macro step ahead with the terminal state of the L1 plan,
+    which is exactly ``l2_step_skip`` primitives ahead.
+
+    Returns a dict of per-environment tensors of shape ``(B,)``:
+    ``cross_mse``, ``cross_l2``, ``l2_subgoal_norm``, ``l1_terminal_norm``.
+    """
+    if not torch.is_tensor(l1_pred_obs) or not torch.is_tensor(l2_pred_obs):
+        raise TypeError("l1_pred_obs and l2_pred_obs must be tensors")
+    if l1_pred_obs.dim() < 4 or l2_pred_obs.dim() < 4:
+        raise ValueError(
+            "expected (T, B, ...) predictions, got "
+            f"{tuple(l1_pred_obs.shape)} and {tuple(l2_pred_obs.shape)}"
+        )
+    if l2_pred_obs.shape[0] <= subgoal_index:
+        raise RuntimeError(
+            f"l2_pred_obs has {l2_pred_obs.shape[0]} steps, cannot index "
+            f"subgoal at {subgoal_index}"
+        )
+
+    with torch.no_grad():
+        z_low = project_l1_encoding_to_l2(l1_pred_obs[-1], objective)
+        z_high = flatten_conv_output(l2_pred_obs[subgoal_index])
+
+    if z_low.shape != z_high.shape:
+        raise RuntimeError(
+            "cross-level representation mismatch: L1->L2 projection has shape "
+            f"{tuple(z_low.shape)} but the L2 subgoal has shape "
+            f"{tuple(z_high.shape)}"
+        )
+
+    diff = z_low - z_high
+    return {
+        "cross_mse": diff.pow(2).mean(dim=1).detach(),
+        "cross_l2": torch.linalg.vector_norm(diff, dim=1).detach(),
+        "l2_subgoal_norm": torch.linalg.vector_norm(z_high, dim=1).detach(),
+        "l1_terminal_norm": torch.linalg.vector_norm(z_low, dim=1).detach(),
+    }

@@ -2,6 +2,9 @@ from typing import NamedTuple, Optional, TYPE_CHECKING
 from .planner import Planner, PlanningResult
 import torch
 
+from pldm.planning.diagnostics import cross_level_metrics
+from pldm.planning.level_retry import plan_with_retry
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from pldm.planning.d4rl.enums import ExecRepairConfig
 
@@ -28,6 +31,19 @@ class TwoLvlPlanner:
         # byte-for-byte identical to the baseline implementation.
         self.exec_cfg = exec_cfg
         self.chunk_offset = int(chunk_offset)
+        # Step 3: conditional low-level retry. Requires the master switch, the
+        # retry switch and a positive gap threshold; otherwise plan() below is
+        # unchanged w.r.t. the baseline.
+        retry_threshold = float(
+            getattr(exec_cfg, "retry_gap_threshold", 0.0) or 0.0
+        )
+        self._retry_on = bool(
+            exec_cfg is not None
+            and getattr(exec_cfg, "enabled", False)
+            and getattr(exec_cfg, "retry_enabled", False)
+            and retry_threshold > 0.0
+        )
+        self.last_retry_info = None
 
     @property
     def task_id_offset(self) -> int:
@@ -50,6 +66,7 @@ class TwoLvlPlanner:
         diff_loss_idx: Optional[torch.tensor] = None,
     ):
         batch_size = current_state.shape[0]
+        self.last_retry_info = None
 
         proprio_l1 = None
         if curr_proprio_pos is not None and curr_proprio_vel is not None:
@@ -86,16 +103,55 @@ class TwoLvlPlanner:
                 device=encs2.device,
             )
         else:
+            subgoal_index = int(getattr(self.exec_cfg, "subgoal_index", 1))
             self.l1_planner.reset_targets(
-                l2_result.pred_obs[1].detach(), repr_input=True
+                l2_result.pred_obs[subgoal_index].detach(), repr_input=True
             )
 
-            l1_result = self.l1_planner.plan(
+            l1_plan_kwargs = dict(
                 current_state=backbone_output,
                 plan_size=self.l2_step_skip,
                 repr_input=True,
                 curr_proprio_pos=curr_proprio_pos,
                 curr_proprio_vel=curr_proprio_vel,
             )
+            l1_result = self.l1_planner.plan(**l1_plan_kwargs)
+
+            if self._retry_on:
+                l1_result = self._maybe_retry(
+                    l1_result, l1_plan_kwargs, l2_result, subgoal_index
+                )
 
         return TwoLvlPlanningResult(level1=l1_result, level2=l2_result)
+
+    def _maybe_retry(
+        self,
+        first_result: PlanningResult,
+        plan_kwargs: dict,
+        l2_result: PlanningResult,
+        subgoal_index: int,
+    ) -> PlanningResult:
+        """Step 3: give the low-level planner a conditional second attempt."""
+        objective = getattr(self.l1_planner, "objective", None)
+        if objective is None:
+            return first_result
+
+        def gap_fn(result: PlanningResult) -> torch.Tensor:
+            return cross_level_metrics(
+                result.pred_obs,
+                l2_result.pred_obs,
+                objective,
+                subgoal_index=subgoal_index,
+            )["cross_mse"]
+
+        gap_before = gap_fn(first_result)
+        merged, info = plan_with_retry(
+            plan_kwargs=plan_kwargs,
+            planner=self.l1_planner,
+            first_result=first_result,
+            gap_before=gap_before,
+            gap_fn=gap_fn,
+            cfg=self.exec_cfg,
+        )
+        self.last_retry_info = info
+        return merged

@@ -43,6 +43,21 @@ class ExecRepairConfig(ConfigBase):
     # Step 5/6: re-rank high-level candidates with low-level feedback.
     high_feedback_enabled: bool = False
 
+    # ---- Step 3: conditional low-level retry ----
+    # Trigger a retry only when the cross-level gap exceeds this value.
+    # A non-positive value disables the retry path even if retry_enabled=True.
+    retry_gap_threshold: float = 0.0
+    # Accept a retry only if it lowers the gap by more than these amounts.
+    retry_min_improvement: float = 0.0
+    retry_min_improvement_ratio: float = 0.0
+    # Restore CPU/CUDA RNG state when no environment accepts the retry, so a
+    # fully rejected retry leaves the episode's randomness untouched.
+    retry_restore_rng_on_reject: bool = True
+
+    # Index into pred_obs used as the high-level subgoal. pred_obs[0] is the
+    # current state, so index 1 is one macro step (= step_skip primitives).
+    subgoal_index: int = 1
+
     # Global task id = task_id_offset + chunk_offset + env_index.
     # Sharded runs pass ``TASKS_PER_SHARD * shard_index`` here.
     task_id_offset: int = 0

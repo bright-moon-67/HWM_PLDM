@@ -197,6 +197,12 @@ eval_cfg:
       retry_enabled: false
       repair_enabled: false
       high_feedback_enabled: false
+      # Step 3: 低于等于 0 的阈值等于关闭重试（即使 retry_enabled=true）
+      retry_gap_threshold: 0.0
+      retry_min_improvement: 0.0
+      retry_min_improvement_ratio: 0.0
+      retry_restore_rng_on_reject: true
+      subgoal_index: 1
       task_id_offset: 0
       output_dir: ""
       diagnostics_filename: diagnostics.jsonl

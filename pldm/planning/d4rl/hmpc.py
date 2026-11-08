@@ -29,6 +29,7 @@ class HierarchicalD4RLMPCEvaluator(MazeMPCEvaluator):
         prefix: str = "d4rl_h_",
         quick_debug: bool = False,
         l2_use_latent_mean_std: bool = False,
+        output_path: Optional[str] = None,
     ):
         super().__init__(
             config=config,
@@ -40,6 +41,7 @@ class HierarchicalD4RLMPCEvaluator(MazeMPCEvaluator):
             prefix=prefix,
             quick_debug=quick_debug,
             l2_use_latent_mean_std=l2_use_latent_mean_std,
+            output_path=output_path,
         )
 
         self.hierarchical = True

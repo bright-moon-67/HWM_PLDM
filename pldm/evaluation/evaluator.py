@@ -238,6 +238,7 @@ class Evaluator:
                 prefix=f"d4rl_{level}",
                 quick_debug=self.quick_debug,
                 l2_use_latent_mean_std=self.config.l2_use_latent_mean_std,
+                output_path=self.output_path,
             )
         else:
             raise NotImplementedError
@@ -318,6 +319,7 @@ class Evaluator:
                 prefix=f"l2_d4rl_{level}",
                 quick_debug=self.quick_debug,
                 l2_use_latent_mean_std=self.config.l2_use_latent_mean_std,
+                output_path=self.output_path,
             )
 
         return planning_evaluator

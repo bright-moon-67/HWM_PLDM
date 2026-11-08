@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pldm.planning import objectives_v2
 import torch
 from pldm.models.hjepa import HJEPA
@@ -13,6 +15,7 @@ from pldm.models.utils import flatten_conv_output
 from tqdm import tqdm
 from pldm.logger import Logger
 from pldm.models.utils import flatten_ensemble_conv_output
+from pldm.planning.diagnostics import DiagnosticsRecorder
 
 
 class MPCEvaluator(ABC):
@@ -29,6 +32,7 @@ class MPCEvaluator(ABC):
         hierarchical=False,
         env_name=None,
         l2_use_latent_mean_std: bool = False,
+        output_path: Optional[str] = None,
     ):
         self.config = config
         self.model = model
@@ -41,6 +45,7 @@ class MPCEvaluator(ABC):
         self.image_based = image_based
         self.hierarchical = hierarchical
         self.l2_use_latent_mean_std = l2_use_latent_mean_std
+        self.output_path = output_path
 
     def close(self):
         pass
@@ -160,6 +165,21 @@ class MPCEvaluator(ABC):
 
         return planner
 
+    def _make_diagnostics(self, chunk_offset: int):
+        """Recorder for the current chunk, or None when diagnostics are off."""
+        exec_cfg = getattr(self.config, "exec_repair", None)
+        if exec_cfg is None:
+            return None
+        output_dir = getattr(exec_cfg, "output_dir", "") or self.output_path
+        if not output_dir:
+            return None
+        recorder = DiagnosticsRecorder(
+            exec_cfg=exec_cfg,
+            output_dir=output_dir,
+            chunk_offset=chunk_offset,
+        )
+        return recorder if recorder.enabled else None
+
     def _perform_mpc_in_chunks(self):
         """
         Divide it up in chunks in order to prevent OOM
@@ -178,11 +198,17 @@ class MPCEvaluator(ABC):
                     n_envs=chunk_size,
                     chunk_offset=chunk_offset,
                 )
-                mpc_result = self._perform_h_mpc(
-                    h_planner=h_planner,
-                    planner=planner,
-                    envs=envs,
-                )
+                diagnostics = self._make_diagnostics(chunk_offset)
+                try:
+                    mpc_result = self._perform_h_mpc(
+                        h_planner=h_planner,
+                        planner=planner,
+                        envs=envs,
+                        diagnostics=diagnostics,
+                    )
+                finally:
+                    if diagnostics is not None:
+                        diagnostics.close()
             else:
                 mpc_result = self._perform_mpc(
                     planner=planner,
@@ -221,7 +247,7 @@ class MPCEvaluator(ABC):
 
         return mpc_data
 
-    def _perform_h_mpc(self, h_planner, planner, envs):
+    def _perform_h_mpc(self, h_planner, planner, envs, diagnostics=None):
         """
         Hierarchical planning.
         Two stages:
@@ -235,6 +261,7 @@ class MPCEvaluator(ABC):
             planner=h_planner,
             envs=envs,
             bilevel_planning=True,
+            diagnostics=diagnostics,
         )
 
         # Stage 2: Use flat L1 planning for the final steps near the goal
@@ -354,6 +381,7 @@ class MPCEvaluator(ABC):
         envs,
         bilevel_planning: bool = False,
         max_steps_override: int = None,
+        diagnostics=None,
     ):
         """
         Parameters:
@@ -487,6 +515,19 @@ class MPCEvaluator(ABC):
                 if bilevel_planning:
                     planning_result_l2 = planning_result.level2
                     planning_result = planning_result.level1
+
+                    # Step 3: log the retry decision (no-op unless enabled).
+                    if diagnostics is not None:
+                        retry_info = getattr(planner, "last_retry_info", None)
+                        if retry_info is not None:
+                            diagnostics.record(
+                                "retry",
+                                batch_size=len(envs),
+                                step=i,
+                                level="hier",
+                                metrics=retry_info.as_dict(),
+                            )
+                            planner.last_retry_info = None
 
             if bilevel_planning:
                 pred = self._get_relevant_pred(
