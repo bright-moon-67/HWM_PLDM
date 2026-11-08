@@ -2,7 +2,7 @@ from typing import NamedTuple, Optional, TYPE_CHECKING
 from .planner import Planner, PlanningResult
 import torch
 
-from pldm.planning.diagnostics import cross_level_metrics
+from pldm.planning.diagnostics import cross_level_metrics, loggable_gap_metrics
 from pldm.planning.level_retry import plan_with_retry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
@@ -22,10 +22,14 @@ class TwoLvlPlanner:
         l2_step_skip: int,
         exec_cfg: Optional["ExecRepairConfig"] = None,
         chunk_offset: int = 0,
+        replan_every: int = 4,
     ):
         self.l1_planner = l1_planner
         self.l2_planner = l2_planner
         self.l2_step_skip = l2_step_skip
+        # Number of primitives actually executed between two replans. Used to
+        # evaluate "predicted progress" at the horizon that matters.
+        self.replan_every = int(replan_every) if replan_every else 4
         # Research switches (pldm.planning.d4rl.enums.ExecRepairConfig).
         # Step 0 keeps them inert: with every switch off, plan() below is
         # byte-for-byte identical to the baseline implementation.
@@ -50,6 +54,9 @@ class TwoLvlPlanner:
         )
         self.last_retry_info = None
         self.last_diagnostics = None
+        # In-process execution context (may contain large tensors such as the
+        # projected subgoal). Never serialised to JSONL.
+        self.last_exec_context = None
 
     def _subgoal_index(self) -> int:
         """High-level subgoal index. Fixed to 1 unless the master switch is on."""
@@ -80,6 +87,7 @@ class TwoLvlPlanner:
         batch_size = current_state.shape[0]
         self.last_retry_info = None
         self.last_diagnostics = None
+        self.last_exec_context = None
 
         proprio_l1 = None
         if curr_proprio_pos is not None and curr_proprio_vel is not None:
@@ -131,15 +139,15 @@ class TwoLvlPlanner:
             l1_result = self.l1_planner.plan(**l1_plan_kwargs)
 
             gap_metrics = None
-            if self._diag_on or self._retry_on:
-                objective = getattr(self.l1_planner, "objective", None)
-                if objective is not None:
-                    gap_metrics = cross_level_metrics(
-                        l1_result.pred_obs,
-                        l2_result.pred_obs,
-                        objective,
-                        subgoal_index=subgoal_index,
-                    )
+            objective = getattr(self.l1_planner, "objective", None)
+            if (self._diag_on or self._retry_on) and objective is not None:
+                gap_metrics = cross_level_metrics(
+                    l1_result.pred_obs,
+                    l2_result.pred_obs,
+                    objective,
+                    subgoal_index=subgoal_index,
+                    progress_index=self.replan_every,
+                )
 
             if self._retry_on and gap_metrics is not None:
                 l1_result = self._maybe_retry(
@@ -149,17 +157,43 @@ class TwoLvlPlanner:
                     l2_result,
                     subgoal_index,
                 )
+                info = self.last_retry_info
+                if info is not None and bool(info.accepted.any()):
+                    # The merged plan mixes first and second attempts per
+                    # environment, so per-env metrics must be recomputed on the
+                    # plan that will actually be executed.
+                    gap_metrics = cross_level_metrics(
+                        l1_result.pred_obs,
+                        l2_result.pred_obs,
+                        objective,
+                        subgoal_index=subgoal_index,
+                        progress_index=self.replan_every,
+                    )
+
+            if gap_metrics is not None:
+                self.last_exec_context = {
+                    "subgoal_l2": gap_metrics.get("subgoal_l2"),
+                    "initial_dist": gap_metrics.get("initial_dist"),
+                    "pred_progress_h": gap_metrics.get("pred_progress_h"),
+                    "pred_dist_h": gap_metrics.get("pred_dist_h"),
+                    "progress_horizon": gap_metrics.get("progress_horizon"),
+                    "replan_every": self.replan_every,
+                }
 
             if self._diag_on and gap_metrics is not None:
-                self.last_diagnostics = dict(gap_metrics)
+                diagnostics = dict(gap_metrics)
                 if self.last_retry_info is not None:
-                    self.last_diagnostics[
-                        "gap_selected"
-                    ] = self.last_retry_info.gap_selected
+                    diagnostics["gap_selected"] = self.last_retry_info.gap_selected
                     if self.last_retry_info.path_cost_selected is not None:
-                        self.last_diagnostics[
+                        diagnostics[
                             "path_cost_selected"
                         ] = self.last_retry_info.path_cost_selected
+                    diagnostics[
+                        "retry_triggered"
+                    ] = self.last_retry_info.triggered
+                    diagnostics["retry_accepted"] = self.last_retry_info.accepted
+                # ``subgoal_l2`` is a (B, D) tensor: keep it in-process only.
+                self.last_diagnostics = loggable_gap_metrics(diagnostics)
 
         return TwoLvlPlanningResult(level1=l1_result, level2=l2_result)
 
@@ -182,6 +216,7 @@ class TwoLvlPlanner:
                 l2_result.pred_obs,
                 objective,
                 subgoal_index=subgoal_index,
+                progress_index=self.replan_every,
             )
 
         merged, info = plan_with_retry(

@@ -113,6 +113,9 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
     path_costs: Dict[int, List[float]] = defaultdict(list)
     exec_errors: Dict[int, List[float]] = defaultdict(list)
     exec_obs_errors: Dict[int, List[float]] = defaultdict(list)
+    pred_progress: Dict[int, List[float]] = defaultdict(list)
+    real_progress: Dict[int, List[float]] = defaultdict(list)
+    progress_gaps: Dict[int, List[float]] = defaultdict(list)
     gap_series: Dict[int, Dict[int, float]] = defaultdict(dict)
     exec_series: Dict[int, Dict[int, float]] = defaultdict(dict)
     events: Dict[str, int] = defaultdict(int)
@@ -137,8 +140,15 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
                 exec_errors[task_id].append(value)
             for task_id, value in _pair(task_ids, record.get("exec_mse_obs")):
                 exec_obs_errors[task_id].append(value)
-            for task_id, value in _pair(task_ids, record.get("exec_mse_obs")):
                 exec_series[task_id][int(record.get("plan_step", -1))] = value
+            for task_id, value in _pair(task_ids, record.get("pred_progress_h")):
+                pred_progress[task_id].append(value)
+            for task_id, value in _pair(task_ids, record.get("real_progress_h")):
+                real_progress[task_id].append(value)
+            for task_id, value in _pair(
+                task_ids, record.get("execution_progress_gap")
+            ):
+                progress_gaps[task_id].append(value)
 
         elif event == "retry":
             retries.append(record)
@@ -151,6 +161,9 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
             "path_cost": _stats(path_costs.get(task_id, [])),
             "exec_mse_obs": _stats(exec_obs_errors.get(task_id, [])),
             "exec_mse_xy": _stats(exec_errors.get(task_id, [])),
+            "pred_progress_h": _stats(pred_progress.get(task_id, [])),
+            "real_progress_h": _stats(real_progress.get(task_id, [])),
+            "execution_progress_gap": _stats(progress_gaps.get(task_id, [])),
         }
         selected = selected_gaps.get(task_id, [])
         if selected:
@@ -239,6 +252,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         if entry.get("gap_selected"):
             parts.append(
                 "gap_selected mean={:.5f}".format(entry["gap_selected"]["mean"])
+            )
+        if entry.get("execution_progress_gap"):
+            parts.append(
+                "pred_progress={:.3f} real_progress={:.3f} gap={:.3f}".format(
+                    entry["pred_progress_h"]["mean"]
+                    if entry.get("pred_progress_h")
+                    else float("nan"),
+                    entry["real_progress_h"]["mean"]
+                    if entry.get("real_progress_h")
+                    else float("nan"),
+                    entry["execution_progress_gap"]["mean"],
+                )
             )
         if entry.get("corr_cross_exec") and entry["corr_cross_exec"]["pearson"] is not None:
             parts.append(

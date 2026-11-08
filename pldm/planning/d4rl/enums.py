@@ -61,6 +61,21 @@ class ExecRepairConfig(ConfigBase):
     # current state, so index 1 is one macro step (= step_skip primitives).
     subgoal_index: int = 1
 
+    # ---- Warm start hygiene (P0) ----
+    # The low-level MPPI warm start is only refreshed when ``plan_size`` changes,
+    # which never happens for the constant-length L1 plans HWM uses. With this
+    # switch the nominal trajectory is shifted forward by ``replan_every``
+    # primitives before every replan so that index 0 again corresponds to the
+    # next executed step. Pure planning hygiene: it does not add any new
+    # mechanism, it only stops the warm start from being stale.
+    shift_l1_warm_start: bool = False
+
+    # ---- RNG isolation (P1) ----
+    # Run the retried low-level plan inside ``torch.random.fork_rng`` so a retry
+    # cannot perturb the episode's global random stream (and therefore cannot
+    # silently change later disturbance / evaluation randomness).
+    retry_isolate_rng: bool = True
+
     # Global task id = task_id_offset + chunk_offset + env_index.
     # Sharded runs pass ``TASKS_PER_SHARD * shard_index`` here.
     task_id_offset: int = 0

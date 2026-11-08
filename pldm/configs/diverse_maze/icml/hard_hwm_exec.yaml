@@ -203,6 +203,11 @@ eval_cfg:
       retry_min_improvement_ratio: 0.0
       retry_restore_rng_on_reject: true
       retry_require_path_cost_improvement: true
+      # P1: 重试在 fork_rng 沙箱里跑，不推进全局随机流
+      retry_isolate_rng: true
+      # P0: 每次 replan 前把 L1 MPPI 的名义轨迹前移 replan_every 步
+      # （HWM 的 L1 计划长度恒定，原实现因此从不做 warm-start 移位）
+      shift_l1_warm_start: false
       subgoal_index: 1
       task_id_offset: 0
       output_dir: ""

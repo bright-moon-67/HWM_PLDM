@@ -27,6 +27,7 @@ N_STEPS=${N_STEPS:-200}
 RUN_TAG=${RUN_TAG:-single_task${TASK_ID}}
 RETRY=${RETRY:-0}
 THRESHOLD=${THRESHOLD:-0.0}
+SHIFT_WARM=${SHIFT_WARM:-0}
 LOGDIR=${LOGDIR:-${ROOT_DIR}/logs}
 CONFIG=${CONFIG:-configs/diverse_maze/icml/hard_hwm_exec.yaml}
 
@@ -34,6 +35,12 @@ if [ "${RETRY}" = "1" ]; then
     RETRY_BOOL=true
 else
     RETRY_BOOL=false
+fi
+
+if [ "${SHIFT_WARM}" = "1" ]; then
+    SHIFT_WARM_BOOL=true
+else
+    SHIFT_WARM_BOOL=false
 fi
 
 PROBE=${ROOT_DIR}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe
@@ -80,4 +87,5 @@ python train.py --configs "${CONFIG}" --values \
     eval_cfg.h_d4rl_planning.exec_repair.log_diagnostics=true \
     eval_cfg.h_d4rl_planning.exec_repair.retry_enabled="${RETRY_BOOL}" \
     eval_cfg.h_d4rl_planning.exec_repair.retry_gap_threshold="${THRESHOLD}" \
+    eval_cfg.h_d4rl_planning.exec_repair.shift_l1_warm_start="${SHIFT_WARM_BOOL}" \
     > "${LOGDIR}/${RUN_TAG}.log" 2>&1

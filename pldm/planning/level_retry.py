@@ -242,11 +242,26 @@ def plan_with_retry(
 
     snapshot = snapshot_low_level_state(planner)
 
+    # RNG isolation: the retry draws fresh MPPI samples, which would otherwise
+    # advance the global CPU/CUDA RNG and silently change later evaluation /
+    # disturbance randomness. ``fork_rng`` gives the retry a private RNG whose
+    # state is discarded on exit, so the episode's random stream is identical
+    # with and without a retry.
+    isolate_rng = bool(getattr(cfg, "retry_isolate_rng", True))
+    rng_devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+
     try:
-        start = time.time()
-        retry_result = planner.plan(**plan_kwargs)
-        wall_time_s = time.time() - start
-        retry_metrics = metrics_fn(retry_result)
+        if isolate_rng:
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                start = time.time()
+                retry_result = planner.plan(**plan_kwargs)
+                wall_time_s = time.time() - start
+                retry_metrics = metrics_fn(retry_result)
+        else:  # pragma: no cover - ablation path
+            start = time.time()
+            retry_result = planner.plan(**plan_kwargs)
+            wall_time_s = time.time() - start
+            retry_metrics = metrics_fn(retry_result)
     except Exception:
         # Leave no partially updated warm starts behind if the retry fails
         # (OOM, shape errors, ...).

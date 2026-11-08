@@ -30,7 +30,9 @@ import torch  # noqa: E402
 from pldm.planning.diagnostics import (  # noqa: E402
     cross_level_metrics,
     execution_prediction_index,
+    loggable_gap_metrics,
     project_l1_encoding_to_l2,
+    to_jsonable,
 )
 from pldm.planning.level_retry import (  # noqa: E402
     _FIELD_BATCH_DIMS,
@@ -100,12 +102,14 @@ class RetryCfg:
         min_improvement_ratio: float = 0.0,
         restore_rng_on_reject: bool = True,
         require_path_cost: bool = True,
+        isolate_rng: bool = True,
     ):
         self.retry_gap_threshold = threshold
         self.retry_min_improvement = min_improvement
         self.retry_min_improvement_ratio = min_improvement_ratio
         self.retry_restore_rng_on_reject = restore_rng_on_reject
         self.retry_require_path_cost_improvement = require_path_cost
+        self.retry_isolate_rng = isolate_rng
 
 
 class FakeCtrl:
@@ -201,8 +205,32 @@ def v1b_cross_level_metrics_shapes():
         "l2_subgoal_norm",
         "l1_terminal_norm",
         "path_cost",
+        "initial_dist",
+        "pred_dist_h",
+        "pred_dist_T",
+        "pred_progress_h",
+        "pred_progress_T",
+        "progress_horizon",
     ):
         assert metrics[name].shape == (batch,), (name, metrics[name].shape)
+    assert metrics["subgoal_l2"].shape == (batch, 3 * 4 * 4)
+
+    # Progress keys must never leak into the JSONL payload.
+    logged = loggable_gap_metrics(metrics)
+    assert "subgoal_l2" not in logged
+    assert set(logged) == {
+        "cross_mse",
+        "cross_l2",
+        "l2_subgoal_norm",
+        "l1_terminal_norm",
+        "path_cost",
+        "initial_dist",
+        "pred_dist_h",
+        "pred_dist_T",
+        "pred_progress_h",
+        "pred_progress_T",
+        "progress_horizon",
+    }
 
     try:
         cross_level_metrics(l1_pred_obs, l2_pred_obs[:, :, :1], objective)
@@ -493,6 +521,177 @@ def v10_path_cost_guard_can_reject_terminal_improvement():
     )
     assert info2.n_accepted == 1
     assert torch.all(result2.pred_obs == 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# P0 / P1 additions
+# --------------------------------------------------------------------------- #
+class ShiftCtrl:
+    """MPPI-like ctrl: shifting rolls ``U`` forward and refills with ``u_init``."""
+
+    def __init__(self, length: int = 6, value: float = 1.0):
+        self.U = torch.arange(length, dtype=torch.float32).unsqueeze(1).repeat(1, 2)
+        self.U = self.U * value
+        self.u_init = torch.zeros(1, 2)
+        self.shifts = 0
+
+    def shift_nominal_trajectory(self):
+        self.U = torch.roll(self.U, -1, dims=0)
+        self.U[-1] = self.u_init
+        self.shifts += 1
+
+
+class ShiftPlanner:
+    def __init__(self, n_envs: int = 2, length: int = 6):
+        self.ctrls = [ShiftCtrl(length) for _ in range(n_envs)]
+
+
+@case
+def v11_warm_start_shift_advances_nominal_trajectory():
+    from pldm.planning.warm_start import shift_low_level_warm_start
+
+    planner = ShiftPlanner()
+    before = [ctrl.U.clone() for ctrl in planner.ctrls]
+
+    assert shift_low_level_warm_start(planner, 0) == 0
+    for ctrl, u in zip(planner.ctrls, before):
+        assert torch.equal(ctrl.U, u)
+        assert ctrl.shifts == 0
+
+    assert shift_low_level_warm_start(planner, 2) == 2
+    expected = torch.tensor(
+        [[2.0, 2.0], [3.0, 3.0], [4.0, 4.0], [5.0, 5.0], [0.0, 0.0], [0.0, 0.0]]
+    )
+    for ctrl in planner.ctrls:
+        assert torch.equal(ctrl.U, expected), ctrl.U
+        assert ctrl.shifts == 2
+
+    # Missing planner / missing ctrls must be tolerated (flat L1 planners).
+    assert shift_low_level_warm_start(None, 2) == 0
+
+    class _NoShiftCtrl:
+        U = torch.zeros(3, 2)
+
+    class _NoShiftPlanner:
+        ctrls = [_NoShiftCtrl()]
+
+    assert shift_low_level_warm_start(_NoShiftPlanner(), 2) == 0
+
+
+@case
+def v12_predicted_progress_semantics():
+    torch.manual_seed(3)
+    batch, steps = 2, 5
+    # alpha_t * 1 == how much of the way to the subgoal the plan predicts to be.
+    alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+    l1_pred_obs = torch.stack(
+        [torch.full((batch, 2, 4, 4), a) for a in alphas], dim=0
+    )
+    l2_pred_obs = torch.ones(steps, batch, 2, 4, 4)
+
+    objective = FakeObjective(FakeEncoder(False), None)
+    metrics = cross_level_metrics(
+        l1_pred_obs, l2_pred_obs, objective, subgoal_index=1, progress_index=2
+    )
+
+    assert torch.allclose(metrics["initial_dist"], torch.ones(batch), atol=1e-6)
+    assert torch.allclose(
+        metrics["pred_dist_h"], torch.full((batch,), 0.25), atol=1e-6
+    )
+    assert torch.allclose(
+        metrics["pred_progress_h"], torch.full((batch,), 0.75), atol=1e-6
+    )
+    assert torch.allclose(
+        metrics["pred_progress_T"], torch.ones(batch), atol=1e-6
+    )
+    assert torch.allclose(
+        metrics["progress_horizon"], torch.full((batch,), 2.0), atol=1e-6
+    )
+
+    # Out-of-range horizons are clamped instead of silently producing NaN.
+    clamped = cross_level_metrics(
+        l1_pred_obs, l2_pred_obs, objective, subgoal_index=1, progress_index=99
+    )
+    assert torch.allclose(
+        clamped["progress_horizon"], torch.full((batch,), float(steps - 1))
+    )
+    assert torch.allclose(clamped["pred_progress_h"], torch.ones(batch), atol=1e-6)
+
+
+@case
+def v13_retry_rng_is_isolated_even_when_accepted():
+    first = make_result(0.0)
+    rng_before = torch.get_rng_state()
+
+    planner = FakeLowPlanner(make_result(1.0))
+    result, info = plan_with_retry(
+        planner,
+        {},
+        first,
+        {"cross_mse": torch.tensor([0.5, 0.5])},
+        lambda _result: {"cross_mse": torch.tensor([0.1, 0.1])},
+        RetryCfg(threshold=0.2, require_path_cost=False, isolate_rng=True),
+    )
+    assert info.n_accepted == 2
+    assert torch.all(result.pred_obs == 1.0)
+    assert torch.equal(torch.get_rng_state(), rng_before), "retry advanced the RNG"
+
+    # Ablation: without isolation the retry is allowed to advance the stream.
+    planner2 = FakeLowPlanner(make_result(1.0))
+    _, info2 = plan_with_retry(
+        planner2,
+        {},
+        make_result(0.0),
+        {"cross_mse": torch.tensor([0.5, 0.5])},
+        lambda _result: {"cross_mse": torch.tensor([0.1, 0.1])},
+        RetryCfg(
+            threshold=0.2,
+            require_path_cost=False,
+            isolate_rng=False,
+            restore_rng_on_reject=False,
+        ),
+    )
+    assert info2.n_accepted == 2
+    assert not torch.equal(torch.get_rng_state(), rng_before)
+
+
+@case
+def v14_jsonl_schema_v2_preserves_shapes():
+    payload = to_jsonable(
+        {
+            "scalar": torch.tensor(1.5),
+            "pair": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "flags": torch.tensor([True, False]),
+            "nested": [torch.tensor([1.0, 2.0, 3.0])],
+        }
+    )
+    assert payload["scalar"] == 1.5
+    assert payload["pair"] == [[1.0, 2.0], [3.0, 4.0]]
+    assert payload["flags"] == [True, False]
+    assert payload["nested"][0] == [1.0, 2.0, 3.0]
+
+    import json
+    import tempfile
+    from pldm.planning.diagnostics import DiagnosticsRecorder
+
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = DiagnosticsRecorder(
+            exec_cfg=None, output_dir=tmp, filename="d.jsonl", enabled=True
+        )
+        recorder.record(
+            "plan_gap",
+            batch_size=2,
+            step=4,
+            level="hier",
+            metrics={"cross_mse": torch.tensor([0.1, 0.2])},
+        )
+        recorder.close()
+        with open(Path(tmp) / "d.jsonl", "r", encoding="utf-8") as handle:
+            record = json.loads(handle.readline())
+        assert record["schema_version"] == 2
+        assert record["task_ids"] == [0, 1]
+        assert record["cross_mse"] == [record["cross_mse"][0], record["cross_mse"][1]]
+        assert isinstance(record["cross_mse"], list) and len(record["cross_mse"]) == 2
 
 
 def main() -> int:

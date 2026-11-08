@@ -27,16 +27,17 @@ ScalarLike = Union[int, float, bool, torch.Tensor]
 
 
 def to_jsonable(value: Any) -> Any:
-    """Convert tensors / containers into JSON-serialisable python objects."""
+    """Convert tensors / containers into JSON-serialisable python objects.
+
+    Tensor shapes are preserved (``(B, 2)`` becomes a list of pairs), which is
+    the ``schema_version=2`` behaviour. Callers that read older logs must
+    tolerate the flattened ``schema_version=1`` layout.
+    """
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu()
         if tensor.numel() == 1:
             return tensor.item()
-        if tensor.dtype == torch.bool:
-            return [bool(x) for x in tensor.flatten().tolist()]
-        if tensor.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
-            return [int(x) for x in tensor.flatten().tolist()]
-        return [float(x) for x in tensor.flatten().tolist()]
+        return tensor.tolist()
     if isinstance(value, dict):
         return {str(k): to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -134,7 +135,11 @@ class DiagnosticsRecorder:
         if not self.enabled:
             return
 
-        payload: Dict[str, Any] = {"time": round(time.time(), 3), "event": str(event)}
+        payload: Dict[str, Any] = {
+            "schema_version": 2,
+            "time": round(time.time(), 3),
+            "event": str(event),
+        }
         if level is not None:
             payload["level"] = level
         if step is not None:
@@ -261,6 +266,7 @@ def cross_level_metrics(
     objective: Any,
     *,
     subgoal_index: int = 1,
+    progress_index: int = 4,
 ) -> Dict[str, torch.Tensor]:
     """Cross-level prediction disagreement for one planning decision.
 
@@ -269,8 +275,18 @@ def cross_level_metrics(
     the L2 subgoal one macro step ahead with the terminal state of the L1 plan,
     which is exactly ``l2_step_skip`` primitives ahead.
 
+    ``progress_index`` selects the primitive step inside the L1 prediction at
+    which "predicted progress" is measured. It should equal the number of
+    primitives that will actually be executed before the next replan
+    (``replan_every``); otherwise the progress metric is evaluated at the wrong
+    horizon. It is clamped to the available horizon.
+
     Returns a dict of per-environment tensors of shape ``(B,)``:
-    ``cross_mse``, ``cross_l2``, ``l2_subgoal_norm``, ``l1_terminal_norm``.
+    ``cross_mse``, ``cross_l2``, ``l2_subgoal_norm``, ``l1_terminal_norm``,
+    ``path_cost``, ``initial_dist``, ``pred_dist_h``, ``pred_dist_T``,
+    ``pred_progress_h``, ``pred_progress_T``, ``progress_horizon``.
+    ``subgoal_l2`` is additionally returned with shape ``(B, D)``; it is *not*
+    JSON-serialisable-friendly for logging and must stay out of diagnostics.
     """
     if not torch.is_tensor(l1_pred_obs) or not torch.is_tensor(l2_pred_obs):
         raise TypeError("l1_pred_obs and l2_pred_obs must be tensors")
@@ -313,12 +329,38 @@ def cross_level_metrics(
     else:  # pragma: no cover - degenerate horizon
         path_cost = torch.zeros_like(diff.pow(2).mean(dim=1))
 
+    # ---------------------------------------------------------------- progress
+    # How much of the distance to the subgoal does the L1 plan predict to close
+    # if we execute ``progress_index`` primitives? This is the quantity the
+    # retry trigger *should* care about: a plan that is far from the subgoal but
+    # moving quickly towards it is not necessarily a bad plan.
+    horizon = int(z_low_all.shape[0])
+    if progress_index is None:
+        progress_index = horizon - 1
+    progress_index = int(progress_index)
+    progress_index = max(1, min(progress_index, horizon - 1)) if horizon > 1 else 0
+
+    z_start = z_low_all[0]
+    d0 = (z_start - z_high).pow(2).mean(dim=1)
+    d_h = (z_low_all[progress_index] - z_high).pow(2).mean(dim=1)
+    d_T = (z_low - z_high).pow(2).mean(dim=1)
+    denom = d0.clamp_min(1e-8)
+
     return {
         "cross_mse": diff.pow(2).mean(dim=1).detach(),
         "cross_l2": torch.linalg.vector_norm(diff, dim=1).detach(),
         "l2_subgoal_norm": torch.linalg.vector_norm(z_high, dim=1).detach(),
         "l1_terminal_norm": torch.linalg.vector_norm(z_low, dim=1).detach(),
         "path_cost": path_cost.detach(),
+        "initial_dist": d0.detach(),
+        "pred_dist_h": d_h.detach(),
+        "pred_dist_T": d_T.detach(),
+        "pred_progress_h": ((d0 - d_h) / denom).detach(),
+        "pred_progress_T": ((d0 - d_T) / denom).detach(),
+        "progress_horizon": torch.full_like(
+            d0.detach(), float(progress_index), dtype=torch.float32
+        ),
+        "subgoal_l2": z_high.detach(),
     }
 
 
@@ -334,3 +376,35 @@ def execution_prediction_index(
     if replan_every <= 0 or num_pred_steps <= replan_every:
         return None
     return int(replan_every)
+
+
+#: Keys of :func:`cross_level_metrics` that may be written to JSONL.
+#: ``subgoal_l2`` is a large ``(B, D)`` tensor used only in-process.
+LOGGABLE_GAP_KEYS = (
+    "cross_mse",
+    "cross_l2",
+    "l2_subgoal_norm",
+    "l1_terminal_norm",
+    "path_cost",
+    "initial_dist",
+    "pred_dist_h",
+    "pred_dist_T",
+    "pred_progress_h",
+    "pred_progress_T",
+    "progress_horizon",
+)
+
+
+def loggable_gap_metrics(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Filter a metrics dict down to the JSONL-loggable scalar entries."""
+    if not metrics:
+        return {}
+    out: Dict[str, Any] = {}
+    for key in LOGGABLE_GAP_KEYS:
+        if key in metrics and metrics[key] is not None:
+            out[key] = metrics[key]
+    for key in ("gap_selected", "path_cost_selected", "retry_triggered", "retry_accepted"):
+        if key in metrics and metrics[key] is not None:
+            out[key] = metrics[key]
+    return out
+

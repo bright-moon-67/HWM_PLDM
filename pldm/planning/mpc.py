@@ -18,7 +18,9 @@ from pldm.models.utils import flatten_ensemble_conv_output
 from pldm.planning.diagnostics import (
     DiagnosticsRecorder,
     execution_prediction_index,
+    project_l1_encoding_to_l2,
 )
+from pldm.planning.warm_start import shift_low_level_warm_start
 
 
 class MPCEvaluator(ABC):
@@ -87,9 +89,23 @@ class MPCEvaluator(ABC):
             # planner (or config), never on the evaluator.
             exec_cfg=getattr(self.config, "exec_repair", None),
             chunk_offset=chunk_offset,
+            replan_every=int(getattr(self.config, "replan_every", 4) or 4),
         )
 
         return h_planner
+
+    # ------------------------------------------------------------ research cfg
+    def _exec_cfg(self):
+        return getattr(self.config, "exec_repair", None)
+
+    def _should_shift_l1_warm_start(self) -> bool:
+        """Whether to refresh the low-level MPPI warm start before replanning."""
+        cfg = self._exec_cfg()
+        return bool(
+            cfg is not None
+            and getattr(cfg, "enabled", False)
+            and getattr(cfg, "shift_l1_warm_start", False)
+        )
 
     def _construct_planner(
         self,
@@ -201,12 +217,19 @@ class MPCEvaluator(ABC):
         last_infos,
         step: int,
         n_envs: int,
+        objective=None,
     ):
         """Compare the stored low-level prediction with the real observation.
 
         The primary metric lives in the level-1 encoding space (the same space
         as the planner's prediction); XY is recorded as a secondary, prober
         dependent reference.
+
+        When the execution context captured at plan time is available, an
+        *execution progress gap* is also reported:
+        ``pred_progress_h - real_progress_h``. It isolates "the plan did not move
+        as far towards the subgoal as predicted" from "the plan was bad in the
+        first place", which is the distinction the retry trigger needs.
         """
         proprio = None
         if curr_proprio_pos is not None and curr_proprio_vel is not None:
@@ -225,6 +248,18 @@ class MPCEvaluator(ABC):
                 ),
             )
             z_real = backbone_output.obs_component.detach().cpu()
+            z_real_l2 = None
+            if objective is not None:
+                try:
+                    z_real_l2 = (
+                        project_l1_encoding_to_l2(
+                            backbone_output.obs_component.detach(), objective
+                        )
+                        .detach()
+                        .cpu()
+                    )
+                except Exception:  # pragma: no cover - diagnostics must not crash
+                    z_real_l2 = None
 
         z_pred = pending["pred_obs"]
         if z_pred.shape != z_real.shape:
@@ -240,6 +275,25 @@ class MPCEvaluator(ABC):
             "exec_mse_obs": flat_diff.pow(2).mean(dim=1),
             "exec_l2_obs": torch.linalg.vector_norm(flat_diff, dim=1),
         }
+
+        # ------------------------------------------------ execution progress
+        subgoal = pending.get("subgoal_l2")
+        initial_dist = pending.get("initial_dist")
+        if (
+            z_real_l2 is not None
+            and subgoal is not None
+            and initial_dist is not None
+            and z_real_l2.shape == subgoal.shape
+        ):
+            real_dist = (z_real_l2 - subgoal).pow(2).mean(dim=1)
+            real_progress = (initial_dist - real_dist) / initial_dist.clamp_min(1e-8)
+            metrics["initial_dist"] = initial_dist
+            metrics["real_dist_h"] = real_dist
+            metrics["real_progress_h"] = real_progress
+            pred_progress = pending.get("pred_progress_h")
+            if pred_progress is not None:
+                metrics["pred_progress_h"] = pred_progress
+                metrics["execution_progress_gap"] = pred_progress - real_progress
 
         pred_xy = pending.get("pred_xy")
         if pred_xy is not None and last_infos is not None:
@@ -598,6 +652,11 @@ class MPCEvaluator(ABC):
                         last_infos=last_infos,
                         step=i,
                         n_envs=len(envs),
+                        objective=getattr(
+                            getattr(planner, "l1_planner", planner),
+                            "objective",
+                            None,
+                        ),
                     )
                     pending_exec = None
 
@@ -607,6 +666,21 @@ class MPCEvaluator(ABC):
                 else:
                     plan_size = min(
                         self.config.n_steps - i, self.config.level1.max_plan_length
+                    )
+
+                # P0: the low-level MPPI warm start is only shifted by
+                # ``MPPIPlanner`` when the plan length shrinks, which never
+                # happens with the constant L1 plan length used here. Advance it
+                # manually so index 0 again corresponds to the next executed
+                # primitive instead of a stale one.
+                if (
+                    bilevel_planning
+                    and i > 0
+                    and self._should_shift_l1_warm_start()
+                ):
+                    shift_low_level_warm_start(
+                        getattr(planner, "l1_planner", None),
+                        int(self.config.replan_every),
                     )
 
                 planning_result = planner.plan(
@@ -667,11 +741,32 @@ class MPCEvaluator(ABC):
                                 ):
                                     loc = locations[pred_index].detach().cpu()
                                     pred_xy = loc.reshape(loc.shape[0], -1)[:, :2]
+                                # Execution context captured *after* the retry
+                                # decision, so the progress metrics describe the
+                                # plan that is actually executed.
+                                exec_context = (
+                                    getattr(planner, "last_exec_context", None) or {}
+                                )
+
+                                def _cpu(value):
+                                    if torch.is_tensor(value):
+                                        return value.detach().cpu()
+                                    return value
+
                                 pending_exec = {
                                     "pred_obs": pred_obs[pred_index].detach().cpu(),
                                     "pred_xy": pred_xy,
                                     "plan_step": i,
                                     "horizon": pred_index,
+                                    "subgoal_l2": _cpu(
+                                        exec_context.get("subgoal_l2")
+                                    ),
+                                    "initial_dist": _cpu(
+                                        exec_context.get("initial_dist")
+                                    ),
+                                    "pred_progress_h": _cpu(
+                                        exec_context.get("pred_progress_h")
+                                    ),
                                 }
 
             if bilevel_planning:
