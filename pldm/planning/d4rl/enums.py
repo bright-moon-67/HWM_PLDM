@@ -73,6 +73,10 @@ class ExecRepairConfig(ConfigBase):
     # Accept a repaired macro action only if it lowers the cross-level gap by
     # more than this amount.
     repair_min_improvement: float = 0.0
+    # Cross-level gap above which the repair branch is allowed to fire. Kept
+    # separate from ``retry_gap_threshold`` so E2 (retry) and E3/E4 (repair) use
+    # their own budgets; 0 falls back to ``retry_gap_threshold``.
+    repair_gap_threshold: float = 0.0
     # ... and does not make the cross-level gap worse by more than this.
     repair_gap_tolerance: float = 0.0
     # Re-raise exceptions from the experimental repair branch (debugging only).

@@ -310,6 +310,18 @@ def select_reachable_subgoal(
 
 
 
+def _repair_threshold(cfg: Any) -> float:
+    """Gap threshold that gates the repair branch.
+
+    ``repair_gap_threshold`` is the dedicated knob (review 3, step 3); a value
+    <= 0 falls back to ``retry_gap_threshold`` for backwards compatibility.
+    """
+    threshold = float(getattr(cfg, "repair_gap_threshold", 0.0) or 0.0)
+    if threshold <= 0.0:
+        threshold = float(getattr(cfg, "retry_gap_threshold", 0.0) or 0.0)
+    return threshold
+
+
 def should_repair(
     *,
     cross_mse: Optional[torch.Tensor],
@@ -365,7 +377,7 @@ def plan_with_high_level_reselection(
     """
     gap_before = l1_first_metrics["cross_mse"].detach()
     n_candidates = int(getattr(cfg, "high_resample_count", 2) or 0)
-    threshold = float(getattr(cfg, "retry_gap_threshold", 0.0))
+    threshold = _repair_threshold(cfg)
 
     triggered = should_repair(
         cross_mse=gap_before,
@@ -688,7 +700,7 @@ def plan_with_reachable_projection(
     repaired plan would not get closer to the high-level subgoal.
     """
     gap_before = l1_first_metrics["cross_mse"].detach()
-    threshold = float(getattr(cfg, "retry_gap_threshold", 0.0))
+    threshold = _repair_threshold(cfg)
     triggered = should_repair(
         cross_mse=gap_before,
         gap_threshold=threshold,

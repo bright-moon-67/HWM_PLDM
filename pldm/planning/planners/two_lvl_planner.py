@@ -87,10 +87,16 @@ class TwoLvlPlanner:
             if self._projection_mode
             else int(getattr(exec_cfg, "high_resample_count", 0) or 0)
         )
+        repair_threshold = float(
+            getattr(exec_cfg, "repair_gap_threshold", 0.0) or 0.0
+        )
+        if repair_threshold <= 0.0:
+            repair_threshold = retry_threshold
+        self.repair_gap_threshold = repair_threshold
         self._repair_on = bool(
             self._research_on
             and getattr(exec_cfg, "repair_enabled", False)
-            and retry_threshold > 0.0
+            and repair_threshold > 0.0
             and mode_candidates > 0
         )
         self.last_retry_info = None
