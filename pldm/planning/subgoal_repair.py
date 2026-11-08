@@ -87,6 +87,11 @@ class RepairInfo:
     score_selected: Optional[torch.Tensor] = None
     lambda_used: Optional[torch.Tensor] = None
     reachable_valid: Optional[torch.Tensor] = None
+    # Spread of the cross-level gap across the freshly sampled candidates. If
+    # this is ~0 the candidates are essentially identical (chained warm start or
+    # degenerate search), which makes extra resampling pointless.
+    candidate_gap_spread: Optional[torch.Tensor] = None
+    candidate_jh_spread: Optional[torch.Tensor] = None
 
     @property
     def n_triggered(self) -> int:
@@ -117,6 +122,8 @@ class RepairInfo:
             "score_selected",
             "lambda_used",
             "reachable_valid",
+            "candidate_gap_spread",
+            "candidate_jh_spread",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -543,6 +550,17 @@ def plan_with_high_level_reselection(
         score_before=score_before,
         score_selected=torch.where(accepted, selected_score, score_before),
         lambda_used=lam,
+        candidate_gap_spread=(
+            gaps[1:].max(dim=0).values - gaps[1:].min(dim=0).values
+            if gaps.shape[0] > 1
+            else None
+        ),
+        candidate_jh_spread=(
+            None
+            if any(j is None for j in candidate_jh[1:])
+            else torch.stack(candidate_jh[1:], dim=0).max(dim=0).values
+            - torch.stack(candidate_jh[1:], dim=0).min(dim=0).values
+        ),
     )
 
 
