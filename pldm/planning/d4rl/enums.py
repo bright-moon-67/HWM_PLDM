@@ -47,6 +47,14 @@ class ExecRepairConfig(ConfigBase):
     # Trigger a retry only when the cross-level gap exceeds this value.
     # A non-positive value disables the retry path even if retry_enabled=True.
     retry_gap_threshold: float = 0.0
+    # Which quantity decides *whether* to retry:
+    #   "cross_mse"     -> absolute terminal gap > retry_gap_threshold
+    #   "pred_progress" -> predicted progress < retry_progress_threshold
+    # Predicting "this plan closes less than X% of the subgoal distance in the
+    # steps we will actually execute" is closer to a failure signal than the
+    # absolute gap, which mostly tracks how far the subgoal happens to be.
+    retry_trigger_metric: str = "cross_mse"
+    retry_progress_threshold: float = 0.0
     # Accept a retry only if it lowers the gap by more than these amounts.
     retry_min_improvement: float = 0.0
     retry_min_improvement_ratio: float = 0.0

@@ -199,6 +199,9 @@ eval_cfg:
       high_feedback_enabled: false
       # Step 3: 低于等于 0 的阈值等于关闭重试（即使 retry_enabled=true）
       retry_gap_threshold: 0.0
+      # cross_mse：按绝对跨层残差触发；pred_progress：按预测进展低于阈值触发
+      retry_trigger_metric: cross_mse
+      retry_progress_threshold: 0.0
       retry_min_improvement: 0.0
       retry_min_improvement_ratio: 0.0
       retry_restore_rng_on_reject: true

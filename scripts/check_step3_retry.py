@@ -104,8 +104,12 @@ class RetryCfg:
         require_path_cost: bool = True,
         isolate_rng: bool = True,
         path_cost_weight: float = 0.0,
+        trigger_metric: str = "cross_mse",
+        progress_threshold: float = 0.0,
     ):
         self.retry_gap_threshold = threshold
+        self.retry_trigger_metric = trigger_metric
+        self.retry_progress_threshold = progress_threshold
         self.retry_min_improvement = min_improvement
         self.retry_min_improvement_ratio = min_improvement_ratio
         self.retry_restore_rng_on_reject = restore_rng_on_reject
@@ -745,6 +749,68 @@ def v15_path_cost_guard_ablation_and_soft_weight():
     )
     assert info_hard.n_accepted == 0
     assert info_hard.n_path_cost_veto == 1
+
+
+@case
+def v16_progress_trigger_selects_different_decisions():
+    first = make_result(0.0)
+    # Same absolute gap for both envs, but env 0 is predicted to make progress
+    # while env 1 is not -> only env 1 should be retried in progress mode.
+    first_metrics = {
+        "cross_mse": torch.tensor([0.30, 0.30]),
+        "path_cost": torch.tensor([1.0, 1.0]),
+        "pred_progress_h": torch.tensor([0.80, 0.10]),
+    }
+
+    def metrics_fn(_result):
+        return {
+            "cross_mse": torch.tensor([0.20, 0.10]),
+            "path_cost": torch.tensor([0.9, 0.9]),
+        }
+
+    _, gap_mode = plan_with_retry(
+        FakeLowPlanner(make_result(1.0)),
+        {},
+        first,
+        first_metrics,
+        metrics_fn,
+        RetryCfg(threshold=0.2, require_path_cost=False),
+    )
+    assert gap_mode.n_triggered == 2
+
+    progress_cfg = RetryCfg(
+        threshold=0.0,
+        require_path_cost=False,
+        trigger_metric="pred_progress",
+        progress_threshold=0.5,
+    )
+    _, progress_mode = plan_with_retry(
+        FakeLowPlanner(make_result(1.0)),
+        {},
+        first,
+        first_metrics,
+        metrics_fn,
+        progress_cfg,
+    )
+    assert progress_mode.n_triggered == 1, progress_mode.triggered
+    assert bool(progress_mode.triggered[1]) and not bool(progress_mode.triggered[0])
+    assert progress_mode.n_accepted == 1
+
+    # Gating follows the selected metric: threshold 0 with progress mode off.
+    gated = RetryCfg(threshold=0.0, require_path_cost=False)
+    assert TwoLvlPlanner(None, None, 10, exec_cfg=_with_flags(gated))._retry_on is False
+    assert (
+        TwoLvlPlanner(None, None, 10, exec_cfg=_with_flags(progress_cfg))._retry_on
+        is True
+    )
+
+
+def _with_flags(cfg):
+    cfg.enabled = True
+    cfg.retry_enabled = True
+    cfg.log_diagnostics = False
+    cfg.subgoal_index = 1
+    return cfg
 
 
 def main() -> int:

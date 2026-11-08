@@ -233,10 +233,20 @@ def plan_with_retry(
         path_before = path_before.detach()
 
     threshold = float(getattr(cfg, "retry_gap_threshold", 0.0))
-    if threshold > 0.0:
+    mode = str(getattr(cfg, "retry_trigger_metric", "cross_mse") or "cross_mse")
+    mode = mode.strip().lower()
+
+    triggered = torch.zeros_like(gap_before, dtype=torch.bool)
+    if mode in ("pred_progress", "progress"):
+        # Retry when the plan predicts too little progress towards the subgoal
+        # over the primitives that will actually be executed before the next
+        # replan.
+        progress_threshold = float(getattr(cfg, "retry_progress_threshold", 0.0))
+        progress = first_metrics.get("pred_progress_h")
+        if progress is not None and progress_threshold > 0.0:
+            triggered = progress.detach() < progress_threshold
+    elif threshold > 0.0:
         triggered = gap_before > threshold
-    else:
-        triggered = torch.zeros_like(gap_before, dtype=torch.bool)
     triggered = triggered.to(dtype=torch.bool)
 
     if not bool(triggered.any()):

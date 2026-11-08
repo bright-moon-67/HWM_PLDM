@@ -47,10 +47,21 @@ class TwoLvlPlanner:
         retry_threshold = float(
             getattr(exec_cfg, "retry_gap_threshold", 0.0) or 0.0
         )
+        retry_mode = str(
+            getattr(exec_cfg, "retry_trigger_metric", "cross_mse") or "cross_mse"
+        ).lower()
+        progress_threshold = float(
+            getattr(exec_cfg, "retry_progress_threshold", 0.0) or 0.0
+        )
+        retry_configured = (
+            retry_threshold > 0.0
+            if retry_mode not in ("pred_progress", "progress")
+            else progress_threshold > 0.0
+        )
         self._retry_on = bool(
             self._research_on
             and getattr(exec_cfg, "retry_enabled", False)
-            and retry_threshold > 0.0
+            and retry_configured
         )
         self.last_retry_info = None
         self.last_diagnostics = None
