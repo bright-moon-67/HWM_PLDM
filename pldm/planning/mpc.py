@@ -20,6 +20,7 @@ from pldm.planning.diagnostics import (
     execution_prediction_index,
     project_l1_encoding_to_l2,
 )
+from pldm.planning.exec_feedback import ExecutionFeedback
 from pldm.planning.warm_start import shift_low_level_warm_start
 
 
@@ -72,7 +73,7 @@ class MPCEvaluator(ABC):
 
         return chunk_sizes
 
-    def _construct_h_planner(self, n_envs: int, chunk_offset: int = 0):
+    def _construct_h_planner(self, n_envs: int, chunk_offset: int = 0, exec_feedback=None):
         l1_planner = self._construct_planner(n_envs=n_envs, l1_to_l2=True)
 
         l2_planner = self._construct_planner(
@@ -90,6 +91,7 @@ class MPCEvaluator(ABC):
             exec_cfg=getattr(self.config, "exec_repair", None),
             chunk_offset=chunk_offset,
             replan_every=int(getattr(self.config, "replan_every", 4) or 4),
+            exec_feedback=exec_feedback,
         )
 
         return h_planner
@@ -314,13 +316,15 @@ class MPCEvaluator(ABC):
                 metrics["exec_mse_xy"] = diff_xy.pow(2).mean(dim=-1)
                 metrics["exec_l2_xy"] = torch.linalg.vector_norm(diff_xy, dim=-1)
 
-        diagnostics.record(
-            "exec_error",
-            batch_size=n_envs,
-            step=step,
-            level="hier",
-            metrics=metrics,
-        )
+        if diagnostics is not None:
+            diagnostics.record(
+                "exec_error",
+                batch_size=n_envs,
+                step=step,
+                level="hier",
+                metrics=metrics,
+            )
+        return metrics
 
     def _perform_mpc_in_chunks(self):
         """
@@ -336,9 +340,13 @@ class MPCEvaluator(ABC):
             planner = self._construct_planner(n_envs=chunk_size)
 
             if self.hierarchical:
+                exec_feedback = ExecutionFeedback.from_config(
+                    self._exec_cfg(), n_envs=chunk_size
+                )
                 h_planner = self._construct_h_planner(
                     n_envs=chunk_size,
                     chunk_offset=chunk_offset,
+                    exec_feedback=exec_feedback,
                 )
                 diagnostics = self._make_diagnostics(chunk_offset)
                 try:
@@ -583,6 +591,8 @@ class MPCEvaluator(ABC):
         # Step 2 diagnostics: prediction awaiting ``replan_every`` real steps.
         pending_exec = None
         last_infos = None
+        # Step 6: online execution feedback owned by the hierarchical planner.
+        exec_feedback = getattr(planner, "exec_feedback", None)
 
         init_infos = [e.get_info() for e in envs]
         if "location" in init_infos[0]:
@@ -641,8 +651,10 @@ class MPCEvaluator(ABC):
                 else:
                     curr_locations = None
 
-                if pending_exec is not None and diagnostics is not None:
-                    self._record_exec_error(
+                if pending_exec is not None and (
+                    diagnostics is not None or exec_feedback is not None
+                ):
+                    exec_metrics = self._record_exec_error(
                         diagnostics=diagnostics,
                         pending=pending_exec,
                         obs_t=obs_t,
@@ -658,6 +670,9 @@ class MPCEvaluator(ABC):
                             None,
                         ),
                     )
+                    # Step 6: feed the realised error back into the planner.
+                    if exec_feedback is not None and exec_metrics is not None:
+                        exec_feedback.update(exec_metrics.get("exec_mse_obs"))
                     pending_exec = None
 
                 if bilevel_planning:
@@ -737,7 +752,7 @@ class MPCEvaluator(ABC):
 
                     # Step 2: store the prediction that matches replan_every
                     # executed steps; it is compared at the next replan.
-                    if diagnostics is not None:
+                    if diagnostics is not None or exec_feedback is not None:
                         pred_obs = getattr(planning_result, "pred_obs", None)
                         if pred_obs is not None:
                             pred_index = execution_prediction_index(

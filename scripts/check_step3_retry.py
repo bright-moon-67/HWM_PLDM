@@ -920,6 +920,193 @@ def v17_high_level_reselection_picks_reachable_candidate():
     assert out_l1 is first_l1 and out_l2 is first_l2 and info_quiet is None
 
 
+# --------------------------------------------------------------------------- #
+# Step 4/5/6 additions
+# --------------------------------------------------------------------------- #
+@case
+def v18_execution_feedback_ema_and_weight():
+    from pldm.planning.exec_feedback import ExecutionFeedback
+
+    fb = ExecutionFeedback(beta=0.5, kappa=1.0, lambda_min=0.1, lambda_max=2.0, n_envs=2)
+    assert fb.error_ema is not None and torch.all(fb.error_ema == 0)
+
+    # First update initialises instead of decaying towards zero.
+    fb.update(torch.tensor([0.4, 0.8]))
+    assert torch.allclose(fb.error_ema, torch.tensor([0.4, 0.8]))
+
+    # Second update is a beta-blend.
+    fb.update(torch.tensor([0.8, 0.0]))
+    assert torch.allclose(fb.error_ema, torch.tensor([0.6, 0.4]))
+
+    # Masked entries are untouched.
+    fb.update(torch.tensor([5.0, 5.0]), mask=torch.tensor([False, True]))
+    assert torch.allclose(fb.error_ema, torch.tensor([0.6, 2.7])), fb.error_ema
+
+    weight = fb.penalty_weight(1.0)
+    assert torch.allclose(weight, torch.tensor([1.6, 2.0])), weight  # clipped at 2.0
+
+    # Disabled config yields None; enabled builds from the dataclass fields.
+    from pldm.planning.d4rl.enums import ExecRepairConfig
+
+    off = ExecRepairConfig()
+    assert ExecutionFeedback.from_config(off, n_envs=2) is None
+    on = ExecRepairConfig(exec_feedback_enabled=True, feedback_kappa=2.0)
+    built = ExecutionFeedback.from_config(on, n_envs=3)
+    assert built is not None and built.kappa == 2.0
+
+
+@case
+def v19_reachable_candidates_and_subgoal_selection():
+    import types
+
+    from pldm.planning.subgoal_repair import (
+        build_reachable_candidates,
+        select_reachable_subgoal,
+    )
+
+    class _DynOut:
+        def __init__(self, obs):
+            self.obs_component = obs
+
+    class _Predictor:
+        def _prepare_ensemble_input(self, x):
+            return None if x is None else x.unsqueeze(0)
+
+    class _Dynamics:
+        def __init__(self):
+            self.model = types.SimpleNamespace(predictor=_Predictor())
+
+        def __call__(self, state, proprio, location, raw_location, action, **kw):
+            n = action.shape[1]
+            mean_action = action.mean(dim=0)  # (N, nu)
+            obs = torch.zeros(n, 3, 2, 2)
+            obs[:, 0] = mean_action[:, :1].view(-1, 1, 1)
+            return _DynOut(obs)
+
+    class _Ctrl:
+        def __init__(self, values, costs):
+            k, nu = len(values), 2
+            self.perturbed_action = torch.tensor(values).view(k, 1, 1).repeat(1, 4, nu)
+            self.cost_total = torch.tensor(costs)
+
+    class _LowPlanner:
+        def __init__(self, ctrl):
+            self.ctrls = [ctrl]
+            self.dynamics = _Dynamics()
+
+    # Sample means: 3.0 (best cost), 1.0, 0.5, 2.0 (worst cost).
+    planner = _LowPlanner(_Ctrl([3.0, 1.0, 0.5, 2.0], [0.1, 0.2, 0.05, 0.4]))
+    backbone = torch.zeros(1, 3, 2, 2)
+    candidates = build_reachable_candidates(planner, backbone, top_k=3)
+
+    assert candidates.states.shape == (3, 1, 3, 2, 2), candidates.states.shape
+    # top_k keeps the three cheapest samples (cost order 2, 0, 1).
+    means = candidates.states[:, 0, 0, 0, 0]
+    assert torch.allclose(means, torch.tensor([0.5, 3.0, 1.0])), means
+
+    objective = FakeObjective(FakeEncoder(False), None)
+    goal = torch.zeros(1, 3, 2, 2)
+    selection = select_reachable_subgoal(
+        candidates,
+        goal,
+        objective,
+        current_dist=torch.tensor([4.0]),
+        subgoal_shape=torch.Size((3, 2, 2)),
+    )
+    # mean-squared distance in the flattened space is v^2 / 3 for these fakes.
+    expected = torch.tensor([0.5, 3.0, 1.0]).pow(2) / 3.0
+    assert torch.allclose(selection.dist[:, 0], expected, atol=1e-6), selection.dist
+    assert selection.index.tolist() == [0], selection.index
+    assert bool(selection.valid[0])
+    assert selection.subgoal_l2_map is not None
+    assert selection.subgoal_l2_map.shape == (1, 3, 2, 2)
+    assert torch.allclose(
+        selection.subgoal_l2_map[0, 0], torch.full((2, 2), 0.5)
+    )
+
+    # With an impossible progress requirement nothing is admissible.
+    strict = select_reachable_subgoal(
+        candidates,
+        goal,
+        objective,
+        current_dist=torch.tensor([0.01]),
+        subgoal_shape=torch.Size((3, 2, 2)),
+    )
+    assert not bool(strict.valid[0]), strict.progress[:, 0]
+
+
+@case
+def v20_high_level_cost_weight_changes_selection():
+    import types
+
+    from pldm.planning.subgoal_repair import (
+        _combined_scores,
+        plan_with_high_level_reselection,
+    )
+
+    # Two candidates: candidate 1 has the better low-level reachability (C_L),
+    # candidate 2 the better high-level cost (J_H).
+    gaps = torch.tensor([[0.50], [0.10], [0.40]])
+    high = torch.stack(
+        [torch.tensor([0.20]), torch.tensor([0.50]), torch.tensor([0.05])], dim=0
+    )
+    prefers_low = _combined_scores(gaps, [high[0], high[1], high[2]], torch.tensor([5.0]))
+    prefers_high = _combined_scores(gaps, [high[0], high[1], high[2]], torch.tensor([0.0]))
+    assert prefers_low[:, 0].argmin().item() == 1
+    assert prefers_high[:, 0].argmin().item() == 2
+
+    # End to end with a fake hierarchy: lambda=0 must pick candidate 2.
+    hierarchy = FakeHierarchy(n_envs=1)
+    calls = {"n": 0}
+    cand_gaps = [torch.tensor([0.10]), torch.tensor([0.40])]
+    cand_values = [0.50, 0.05]  # pred_obs[-1] filled with this value
+
+    def metrics_fn(_l1, _l2):
+        value = cand_gaps[calls["n"]]
+        calls["n"] += 1
+        return {"cross_mse": value}
+
+    class _L2(FakeLevelPlanner):
+        def plan(self, **kwargs):
+            self.calls += 1
+            return make_result(cand_values[self.calls - 1], batch=1)
+
+    class _L1(FakeLevelPlanner):
+        def plan(self, **kwargs):
+            self.calls += 1
+            return make_result(float(self.calls), batch=1)
+
+    hierarchy.l1_planner = _L1(n_envs=1)
+    hierarchy.l2_planner = _L2(n_envs=1)
+    hierarchy.l2_planner.objective = types.SimpleNamespace(
+        target_enc=torch.zeros(1, 3)
+    )
+
+    cfg = RetryCfg(threshold=0.2, require_path_cost=False)
+    cfg.repair_enabled = True
+    cfg.high_resample_count = 2
+    cfg.repair_min_improvement = 0.0
+    cfg.high_level_cost_weight = 0.0
+    cfg.repair_gap_tolerance = 0.5
+
+    _, _, info = plan_with_high_level_reselection(
+        h_planner=hierarchy,
+        l2_plan_kwargs={},
+        l1_plan_kwargs={},
+        l1_first_result=make_result(0.0, batch=1),
+        l1_first_metrics={"cross_mse": torch.tensor([0.60])},
+        l2_first_result=make_result(0.20, batch=1),
+        metrics_fn=metrics_fn,
+        cfg=cfg,
+        subgoal_index=1,
+        lambda_vector=torch.tensor([0.0]),
+    )
+    assert info is not None
+    assert info.selected_candidate.tolist() == [2], info.selected_candidate
+    assert info.high_level_cost_before is not None
+    assert torch.allclose(info.lambda_used, torch.tensor([0.0]))
+
+
 def main() -> int:
     failures = []
     for fn in TESTS:

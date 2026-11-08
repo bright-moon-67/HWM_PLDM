@@ -4,7 +4,10 @@ import torch
 
 from pldm.planning.diagnostics import cross_level_metrics, loggable_gap_metrics
 from pldm.planning.level_retry import plan_with_retry
-from pldm.planning.subgoal_repair import plan_with_high_level_reselection
+from pldm.planning.subgoal_repair import (
+    plan_with_high_level_reselection,
+    plan_with_reachable_projection,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from pldm.planning.d4rl.enums import ExecRepairConfig
@@ -24,10 +27,13 @@ class TwoLvlPlanner:
         exec_cfg: Optional["ExecRepairConfig"] = None,
         chunk_offset: int = 0,
         replan_every: int = 4,
+        exec_feedback=None,
     ):
         self.l1_planner = l1_planner
         self.l2_planner = l2_planner
         self.l2_step_skip = l2_step_skip
+        # Step 6: online execution feedback (pldm.planning.exec_feedback).
+        self.exec_feedback = exec_feedback
         # Number of primitives actually executed between two replans. Used to
         # evaluate "predicted progress" at the horizon that matters.
         self.replan_every = int(replan_every) if replan_every else 4
@@ -205,10 +211,10 @@ class TwoLvlPlanner:
 
                 # Step 4/5: if the low-level planner still cannot reach the
                 # subgoal after its retry, the macro action itself may be wrong.
-                # Re-search the L2 plan and keep the candidate whose near subgoal
-                # the low-level planner is predicted to reach best.
+                # Re-search the L2 plan (step 5) or project the subgoal onto
+                # reachable low-level states (step 4).
                 if self._repair_on:
-                    l1_result, l2_result, repair_info = self._maybe_repair(
+                    repair_out = self._maybe_repair(
                         l1_result=l1_result,
                         l2_result=l2_result,
                         l1_plan_kwargs=l1_plan_kwargs,
@@ -220,7 +226,10 @@ class TwoLvlPlanner:
                         gap_metrics=gap_metrics,
                         subgoal_index=subgoal_index,
                         objective=objective,
+                        backbone_output=backbone_output,
+                        batch_size=batch_size,
                     )
+                    l1_result, l2_result, repair_info = repair_out
                     self.last_repair_info = repair_info
                     if repair_info is not None:
                         gap_metrics = cross_level_metrics(
@@ -301,8 +310,13 @@ class TwoLvlPlanner:
         gap_metrics: dict,
         subgoal_index: int,
         objective,
+        backbone_output,
+        batch_size: int,
     ):
-        """Step 4/5: re-search the high-level plan conditioned on reachability."""
+        """Step 4/5: repair the subgoal conditioned on low-level reachability.
+
+        Returns ``(l1_result, l2_result, RepairInfo|None)``.
+        """
 
         def metrics_fn(candidate_l1: PlanningResult, candidate_l2: PlanningResult):
             return cross_level_metrics(
@@ -313,8 +327,27 @@ class TwoLvlPlanner:
                 progress_index=self.replan_every,
             )
 
+        mode = str(
+            getattr(self.exec_cfg, "repair_mode", "reselection") or "reselection"
+        ).lower()
+
         try:
-            return plan_with_high_level_reselection(
+            if mode in ("projection", "reachable", "reachable_projection"):
+                merged, info = plan_with_reachable_projection(
+                    h_planner=self,
+                    backbone_output=backbone_output,
+                    l1_plan_kwargs=l1_plan_kwargs,
+                    l1_first_result=l1_result,
+                    l1_first_metrics=gap_metrics,
+                    l2_result=l2_result,
+                    metrics_fn=metrics_fn,
+                    objective=objective,
+                    cfg=self.exec_cfg,
+                    subgoal_index=subgoal_index,
+                )
+                return merged, l2_result, info
+
+            merged_l1, merged_l2, info = plan_with_high_level_reselection(
                 h_planner=self,
                 l2_plan_kwargs=l2_plan_kwargs,
                 l1_plan_kwargs=l1_plan_kwargs,
@@ -324,10 +357,22 @@ class TwoLvlPlanner:
                 metrics_fn=metrics_fn,
                 cfg=self.exec_cfg,
                 subgoal_index=subgoal_index,
+                lambda_vector=self._repair_lambda(batch_size),
             )
+            return merged_l1, merged_l2, info
         except Exception:
             # The repair branch is experimental: a failure there must not take
             # down the episode. Re-raise only when explicitly debugging.
             if bool(getattr(self.exec_cfg, "repair_raise_errors", False)):
                 raise
             return l1_result, l2_result, None
+
+    def _repair_lambda(self, batch_size: int):
+        """Step 6: per-environment reachability weight, or ``None``."""
+        feedback = self.exec_feedback
+        if feedback is None or not bool(
+            getattr(self.exec_cfg, "exec_feedback_enabled", False)
+        ):
+            return None
+        base = float(getattr(self.exec_cfg, "high_level_cost_weight", 0.5))
+        return feedback.penalty_weight(base, n_envs=batch_size)

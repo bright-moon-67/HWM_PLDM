@@ -39,14 +39,39 @@ class ExecRepairConfig(ConfigBase):
 
     # Step 4: project the high-level subgoal onto low-level reachable states.
     repair_enabled: bool = False
+    # Which repair branch to run when triggered:
+    #   "reselection" -> re-search the L2 plan and re-rank candidates (step 5)
+    #   "projection"  -> project the subgoal onto L1 reachable states (step 4)
+    repair_mode: str = "reselection"
+    # Step 4: how many cheapest MPPI samples to roll out as reachable candidates.
+    repair_top_k: int = 8
+    # Step 4: weight of the normalised MPPI sample cost inside the candidate
+    # score (0 = pure distance to the original subgoal).
+    repair_risk_weight: float = 0.0
+    # Step 4: a candidate must reduce the distance to the original subgoal by
+    # more than this (absolute, in the L2 mean-squared units used everywhere).
+    repair_min_progress: float = 0.0
     # How many extra L2 plans to sample when the repair branch fires. Each
     # candidate costs one extra L2 plan plus one extra L1 plan.
     high_resample_count: int = 2
+    # Step 5: weight lambda_0 of the low-level reachability term in
+    #   score = J_H_norm + lambda * C_L_norm
+    high_level_cost_weight: float = 0.5
     # Accept a repaired macro action only if it lowers the cross-level gap by
     # more than this amount.
     repair_min_improvement: float = 0.0
+    # ... and does not make the cross-level gap worse by more than this.
+    repair_gap_tolerance: float = 0.0
     # Re-raise exceptions from the experimental repair branch (debugging only).
     repair_raise_errors: bool = False
+
+    # ---- Step 6: online execution feedback ----
+    # Adapt lambda_t = clip(lambda_0 * (1 + kappa * EMA(exec_error))) per env.
+    exec_feedback_enabled: bool = False
+    feedback_beta: float = 0.1
+    feedback_kappa: float = 1.0
+    feedback_lambda_min: float = 0.1
+    feedback_lambda_max: float = 10.0
 
     # Step 5/6: re-rank high-level candidates with low-level feedback.
     high_feedback_enabled: bool = False

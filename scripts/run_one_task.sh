@@ -28,6 +28,12 @@ RUN_TAG=${RUN_TAG:-single_task${TASK_ID}}
 RETRY=${RETRY:-0}
 THRESHOLD=${THRESHOLD:-0.0}
 SHIFT_WARM=${SHIFT_WARM:-0}
+REPAIR=${REPAIR:-0}
+REPAIR_MODE=${REPAIR_MODE:-reselection}
+RESAMPLE=${RESAMPLE:-1}
+REPAIR_TOP_K=${REPAIR_TOP_K:-4}
+FEEDBACK=${FEEDBACK:-0}
+REPAIR_DEBUG=${REPAIR_DEBUG:-0}
 LOGDIR=${LOGDIR:-${ROOT_DIR}/logs}
 CONFIG=${CONFIG:-configs/diverse_maze/icml/hard_hwm_exec.yaml}
 
@@ -41,6 +47,18 @@ if [ "${SHIFT_WARM}" = "1" ]; then
     SHIFT_WARM_BOOL=true
 else
     SHIFT_WARM_BOOL=false
+fi
+
+if [ "${REPAIR}" = "1" ]; then
+    REPAIR_BOOL=true
+else
+    REPAIR_BOOL=false
+fi
+
+if [ "${FEEDBACK}" = "1" ]; then
+    FEEDBACK_BOOL=true
+else
+    FEEDBACK_BOOL=false
 fi
 
 PROBE=${ROOT_DIR}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe
@@ -88,4 +106,10 @@ python train.py --configs "${CONFIG}" --values \
     eval_cfg.h_d4rl_planning.exec_repair.retry_enabled="${RETRY_BOOL}" \
     eval_cfg.h_d4rl_planning.exec_repair.retry_gap_threshold="${THRESHOLD}" \
     eval_cfg.h_d4rl_planning.exec_repair.shift_l1_warm_start="${SHIFT_WARM_BOOL}" \
+    eval_cfg.h_d4rl_planning.exec_repair.repair_enabled="${REPAIR_BOOL}" \
+    eval_cfg.h_d4rl_planning.exec_repair.repair_mode="${REPAIR_MODE}" \
+    eval_cfg.h_d4rl_planning.exec_repair.high_resample_count="${RESAMPLE}" \
+    eval_cfg.h_d4rl_planning.exec_repair.repair_top_k="${REPAIR_TOP_K}" \
+    eval_cfg.h_d4rl_planning.exec_repair.exec_feedback_enabled="${FEEDBACK_BOOL}" \
+    eval_cfg.h_d4rl_planning.exec_repair.repair_raise_errors=$([ "${REPAIR_DEBUG}" = "1" ] && echo true || echo false) \
     > "${LOGDIR}/${RUN_TAG}.log" 2>&1

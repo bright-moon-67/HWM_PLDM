@@ -212,11 +212,24 @@ eval_cfg:
       # P0: 每次 replan 前把 L1 MPPI 的名义轨迹前移 replan_every 步
       # （HWM 的 L1 计划长度恒定，原实现因此从不做 warm-start 移位）
       shift_l1_warm_start: false
-      # Step 4/5: 低层重试仍无法到达子目标时，重新搜索高层 macro-action，
-      # 按“低层可达性”为每个环境选择候选
+      # Step 4/5: 低层重试仍无法到达子目标时：reselection = 重新搜索高层计划并重排，
+      # projection = 把子目标投影到低层可达状态
+      repair_mode: reselection
       high_resample_count: 2
+      repair_top_k: 8
+      repair_risk_weight: 0.0
+      repair_min_progress: 0.0
+      # score = J_H_norm + high_level_cost_weight * C_L_norm
+      high_level_cost_weight: 0.5
       repair_min_improvement: 0.0
+      repair_gap_tolerance: 0.0
       repair_raise_errors: false
+      # Step 6: lambda_t = clip(lambda_0 * (1 + kappa * EMA(exec_error)))
+      exec_feedback_enabled: false
+      feedback_beta: 0.1
+      feedback_kappa: 1.0
+      feedback_lambda_min: 0.1
+      feedback_lambda_max: 10.0
       subgoal_index: 1
       task_id_offset: 0
       output_dir: ""

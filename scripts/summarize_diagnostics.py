@@ -120,6 +120,7 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
     exec_series: Dict[int, Dict[int, float]] = defaultdict(dict)
     events: Dict[str, int] = defaultdict(int)
     retries: List[Dict[str, Any]] = []
+    repairs: List[Dict[str, Any]] = []
 
     for record in _iter_jsonl(paths):
         event = record.get("event")
@@ -152,6 +153,9 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
 
         elif event == "retry":
             retries.append(record)
+
+        elif event == "repair":
+            repairs.append(record)
 
     tasks: Dict[str, Any] = {}
     task_ids = sorted(set(gaps) | set(exec_errors) | set(selected_gaps))
@@ -191,11 +195,20 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
         "wall_ms_total": float(sum(float(r.get("wall_ms", 0.0)) for r in retries)),
     }
 
+    repair_summary = {
+        "decisions": len(repairs),
+        "triggered": sum(int(r.get("n_triggered", 0)) for r in repairs),
+        "accepted": sum(int(r.get("n_accepted", 0)) for r in repairs),
+        "wall_ms_total": float(sum(float(r.get("wall_ms", 0.0)) for r in repairs)),
+        "modes": sorted({str(r.get("repair_mode")) for r in repairs}),
+    }
+
     return {
         "files": [str(path) for path in paths],
         "events": dict(events),
         "tasks": tasks,
         "retry": retry_summary,
+        "repair": repair_summary,
     }
 
 
@@ -285,6 +298,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "path_cost_veto={path_cost_veto} "
         "extra_wall={wall_ms_total:.1f} ms".format(**retry)
     )
+    repair = summary["repair"]
+    if repair["decisions"]:
+        print(
+            "repair decisions={decisions} triggered={triggered} "
+            "accepted={accepted} modes={modes} "
+            "extra_wall={wall_ms_total:.1f} ms".format(**repair)
+        )
     print("events:", summary["events"])
 
     if args.out:
