@@ -103,6 +103,7 @@ class RetryCfg:
         restore_rng_on_reject: bool = True,
         require_path_cost: bool = True,
         isolate_rng: bool = True,
+        path_cost_weight: float = 0.0,
     ):
         self.retry_gap_threshold = threshold
         self.retry_min_improvement = min_improvement
@@ -110,6 +111,7 @@ class RetryCfg:
         self.retry_restore_rng_on_reject = restore_rng_on_reject
         self.retry_require_path_cost_improvement = require_path_cost
         self.retry_isolate_rng = isolate_rng
+        self.retry_path_cost_weight = path_cost_weight
 
 
 class FakeCtrl:
@@ -692,6 +694,57 @@ def v14_jsonl_schema_v2_preserves_shapes():
         assert record["task_ids"] == [0, 1]
         assert record["cross_mse"] == [record["cross_mse"][0], record["cross_mse"][1]]
         assert isinstance(record["cross_mse"], list) and len(record["cross_mse"]) == 2
+
+
+@case
+def v15_path_cost_guard_ablation_and_soft_weight():
+    first = make_result(0.0, batch=1)
+    first_metrics = {
+        "cross_mse": torch.tensor([0.5]),
+        "path_cost": torch.tensor([1.0]),
+    }
+    retry_metrics = {
+        "cross_mse": torch.tensor([0.1]),
+        "path_cost": torch.tensor([2.0]),
+    }
+
+    # Hard guard: the improvement is real, but the detour is rejected and the
+    # rejection is counted so the ablation can be measured offline.
+    _, info = plan_with_retry(
+        FakeLowPlanner(make_result(1.0, batch=1), n_envs=1),
+        {},
+        first,
+        first_metrics,
+        lambda _result: retry_metrics,
+        RetryCfg(threshold=0.2, require_path_cost=True),
+    )
+    assert info.n_accepted == 0
+    assert info.n_path_cost_veto == 1
+    assert int(info.accepted_without_path_guard.sum()) == 1
+
+    # Soft constraint: a small weight still accepts the detour...
+    _, info_soft = plan_with_retry(
+        FakeLowPlanner(make_result(1.0, batch=1), n_envs=1),
+        {},
+        first,
+        first_metrics,
+        lambda _result: retry_metrics,
+        RetryCfg(threshold=0.2, require_path_cost=True, path_cost_weight=0.1),
+    )
+    assert info_soft.n_accepted == 1
+    assert info_soft.n_path_cost_veto == 0
+
+    # ...while a large weight rejects it, matching the hard guard's behaviour.
+    _, info_hard = plan_with_retry(
+        FakeLowPlanner(make_result(1.0, batch=1), n_envs=1),
+        {},
+        first,
+        first_metrics,
+        lambda _result: retry_metrics,
+        RetryCfg(threshold=0.2, require_path_cost=False, path_cost_weight=1.0),
+    )
+    assert info_hard.n_accepted == 0
+    assert info_hard.n_path_cost_veto == 1
 
 
 def main() -> int:

@@ -57,6 +57,10 @@ class RetryInfo:
     path_cost_before: Optional[torch.Tensor] = None
     path_cost_after: Optional[torch.Tensor] = None
     path_cost_selected: Optional[torch.Tensor] = None
+    # Acceptance without the path-cost guard, so an ablation can tell how many
+    # candidate retries the guard vetoed (review-2 section 5).
+    accepted_without_path_guard: Optional[torch.Tensor] = None
+    path_cost_veto: Optional[torch.Tensor] = None
 
     @property
     def n_triggered(self) -> int:
@@ -65,6 +69,12 @@ class RetryInfo:
     @property
     def n_accepted(self) -> int:
         return int(self.accepted.sum().item())
+
+    @property
+    def n_path_cost_veto(self) -> int:
+        if self.path_cost_veto is None:
+            return 0
+        return int(self.path_cost_veto.sum().item())
 
     def as_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -76,11 +86,14 @@ class RetryInfo:
             "wall_ms": self.wall_time_s * 1000.0,
             "n_triggered": self.n_triggered,
             "n_accepted": self.n_accepted,
+            "n_path_cost_veto": self.n_path_cost_veto,
         }
         for name in (
             "path_cost_before",
             "path_cost_after",
             "path_cost_selected",
+            "accepted_without_path_guard",
+            "path_cost_veto",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -277,17 +290,29 @@ def plan_with_retry(
     min_abs = float(getattr(cfg, "retry_min_improvement", 0.0))
     min_ratio = float(getattr(cfg, "retry_min_improvement_ratio", 0.0))
 
-    accepted = triggered & (improvement > min_abs)
+    accepted_base = triggered & (improvement > min_abs)
     if min_ratio > 0.0:
         ratio = improvement / gap_before.clamp_min(1e-12)
-        accepted = accepted & (ratio > min_ratio)
-    if (
+        accepted_base = accepted_base & (ratio > min_ratio)
+
+    # Path-level guard. Three modes:
+    #   weight > 0                     -> soft constraint J = d_T + w * J_path
+    #   require_path_cost_improvement  -> hard constraint J_path_after <= before
+    #   otherwise                      -> terminal residual only
+    weight = float(getattr(cfg, "retry_path_cost_weight", 0.0) or 0.0)
+    accepted = accepted_base
+    has_path = path_before is not None and path_after is not None
+    if weight > 0.0 and has_path:
+        score_before = gap_before + weight * path_before
+        score_after = gap_after + weight * path_after
+        accepted = accepted_base & (score_after < score_before)
+    elif (
         bool(getattr(cfg, "retry_require_path_cost_improvement", False))
-        and path_before is not None
-        and path_after is not None
+        and has_path
     ):
-        accepted = accepted & (path_after <= path_before)
+        accepted = accepted_base & (path_after <= path_before)
     accepted = accepted.to(dtype=torch.bool)
+    path_cost_veto = (accepted_base & ~accepted).to(dtype=torch.bool)
 
     merged = (
         blend_planning_results(first_result, retry_result, accepted)
@@ -319,4 +344,6 @@ def plan_with_retry(
         path_cost_before=path_before,
         path_cost_after=path_after,
         path_cost_selected=path_selected,
+        accepted_without_path_guard=accepted_base.to(dtype=torch.bool),
+        path_cost_veto=path_cost_veto,
     )

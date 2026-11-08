@@ -203,6 +203,8 @@ eval_cfg:
       retry_min_improvement_ratio: 0.0
       retry_restore_rng_on_reject: true
       retry_require_path_cost_improvement: true
+      # >0 时改用软约束 J = d_T + w * J_path，覆盖上面的硬约束（消融用）
+      retry_path_cost_weight: 0.0
       # P1: 重试在 fork_rng 沙箱里跑，不推进全局随机流
       retry_isolate_rng: true
       # P0: 每次 replan 前把 L1 MPPI 的名义轨迹前移 replan_every 步

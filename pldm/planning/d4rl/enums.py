@@ -56,6 +56,10 @@ class ExecRepairConfig(ConfigBase):
     # Additionally require the retried plan to be no worse on the path-level
     # cross-level cost (guards against terminal-only improvements).
     retry_require_path_cost_improvement: bool = True
+    # Soft alternative to the hard path-cost guard: accept when
+    # ``d_T + weight * J_path`` improves. A positive value overrides
+    # ``retry_require_path_cost_improvement`` (review-2 section 5 ablation).
+    retry_path_cost_weight: float = 0.0
 
     # Index into pred_obs used as the high-level subgoal. pred_obs[0] is the
     # current state, so index 1 is one macro step (= step_skip primitives).

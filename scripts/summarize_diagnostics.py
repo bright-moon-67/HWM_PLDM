@@ -187,6 +187,7 @@ def collect(paths: List[Path]) -> Dict[str, Any]:
         "decisions": len(retries),
         "triggered": sum(int(r.get("n_triggered", 0)) for r in retries),
         "accepted": sum(int(r.get("n_accepted", 0)) for r in retries),
+        "path_cost_veto": sum(int(r.get("n_path_cost_veto", 0)) for r in retries),
         "wall_ms_total": float(sum(float(r.get("wall_ms", 0.0)) for r in retries)),
     }
 
@@ -281,6 +282,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     retry = summary["retry"]
     print(
         "retry decisions={decisions} triggered={triggered} accepted={accepted} "
+        "path_cost_veto={path_cost_veto} "
         "extra_wall={wall_ms_total:.1f} ms".format(**retry)
     )
     print("events:", summary["events"])
