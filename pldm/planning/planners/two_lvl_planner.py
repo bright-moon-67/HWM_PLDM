@@ -163,7 +163,7 @@ class TwoLvlPlanner:
 
             gap_metrics = None
             objective = getattr(self.l1_planner, "objective", None)
-            if (self._diag_on or self._retry_on) and objective is not None:
+            if (self._diag_on or self._retry_on or self._repair_on) and objective is not None:
                 gap_metrics = cross_level_metrics(
                     l1_result.pred_obs,
                     l2_result.pred_obs,
