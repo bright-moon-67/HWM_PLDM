@@ -1,0 +1,294 @@
+n_steps: &n_steps 15
+val_n_steps: *n_steps
+l2_step_skip: &l2_step_skip 10
+l2_n_steps: &l2_n_steps 6
+env_name: &env_name maze2d_large_diverse
+train_l1: &train_l1 false
+load_l1_only: false
+root_path: &root_path /root/autodl-tmp/.autodl
+
+base_lr: 0.017632900482959527
+data:
+  normalize: true
+  dataset_type: DatasetType.D4RL
+  num_workers: 2
+  prefetch_factor: 2
+  normalizer_hardset: true
+  d4rl_config:
+    train_l1: *train_l1
+    env_name: *env_name
+    random_actions: false
+    img_size: 98
+    alpha: 0.6
+    batch_size: 128
+    beta: 0.4
+    crop_length: null
+    # NOTE: 仅评测。130GB 训练图像未渲染，这里用 probe 数据做训练集的替代，
+    # 只影响 L2 latent bounds 等统计量；规划本身使用环境 + 权重。
+    images_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/images.npy
+    path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/data.p
+    location_only: false
+    num_workers: 2
+    prioritized: false
+    quick_debug: false
+    n_steps: *n_steps
+    seed: 0
+    stack_states: 1
+    train: true
+    val_fraction: 0.2
+    l2_step_skip: *l2_step_skip
+    l2_n_steps: *l2_n_steps
+    chunked_actions: true
+epochs: 5
+eval_at_beginning: false
+eval_during_training: false
+eval_every_n_epochs: 2
+eval_mpcs: 20
+eval_only: true
+hjepa:
+  l1_n_steps: *n_steps
+  train_l1: *train_l1
+  freeze_l1: true
+  disable_l2: false
+  level1:
+    backbone:
+      arch: menet6
+      backbone_subclass: d4rl_a
+      backbone_mlp: null
+      backbone_width_factor: 2
+      input_dim: 4
+      channels: 3
+      late_proprio_cfg:
+        encoder_arch: 'id_expand'
+        ignore: false
+        fuse: true
+    predictor:
+      residual: true
+      action_encoder_arch: 'id'
+      predictor_arch: conv2
+      predictor_subclass: d4rl_b_p
+      rnn_converter_arch: ''
+      rnn_layers: 1
+      rnn_state_dim: 512
+      z_dim: 0
+      z_min_std: 0.1
+    encode_only: false
+    use_z_goal: false
+    action_dim: 2
+  step_skip: *l2_step_skip
+  level2:
+    backbone:
+      arch: identity_encoder
+      input_dim: null
+      channels: 16
+      final_ln: false
+      late_proprio_cfg:
+        encoder_arch: 'id_expand'
+        ignore: false
+        fuse: true
+    predictor:
+      residual: true
+      action_encoder_arch: '8-64-8'
+      predictor_arch: conv2
+      predictor_subclass: l2_d4rl_e_p
+      rnn_converter_arch: ''
+      rnn_layers: 1
+      rnn_state_dim: 512
+      z_dim: 8
+      z_stochastic: false
+      z_discrete: false
+      z_discrete_dim: 16
+      z_discrete_dists: 16
+      z_min_std: 0.05
+      prior_arch: ""
+      posterior_input_type: 'actions'
+      posterior_input_dim: 20
+      posterior_arch: '32-32'
+      posterior_drop_p: 0
+      predictor_ln: true
+      tie_backbone_ln: false
+    encode_only: false
+    use_z_goal: false
+    action_dim: 0
+load_checkpoint_path: ${root_path}/pldm/pretrained/load_from_l1248-seed248_epoch=5_sample_step=10789632.ckpt
+objectives_l2:
+  objectives:
+  - ObjectiveType.PredictionObs
+  - ObjectiveType.PredictionProprio
+  probe:
+    coeff: 1
+    arch_subclass: 'b'
+  vicreg_obs:
+    adjust_cov: true
+    cov_chunk_size: null
+    cov_coeff: 11.925
+    cov_coeff_t: 0
+    cov_per_feature: false
+    projector: id
+    random_projector: false
+    sim_coeff: 1
+    std_coeff: 35.026
+    std_coeff_t: 2.9199
+    sim_coeff_t: 0.10193
+  prediction_proprio:
+    global_coeff: 2.416154262252218
+  prediction_obs:
+    global_coeff: 2.416154262252218
+optimizer_type: Adam
+output_dir: hard_hwm_eval
+output_root: ${root_path}/checkpoint/maze2d_large_diverse/l2_wo_encoder
+eval_cfg:
+  env_name: *env_name
+  log_heatmap: false
+  eval_l1: false
+  disable_planning: true
+  disable_l2_planning: false
+  eval_l2: true
+  l2_latent_bounds_percentile: 2.0
+  l2_use_latent_mean_std: false
+  probing:
+    l1_depth: *n_steps
+    l2_depth: 91
+    train_images_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/images.npy
+    train_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/data.p
+    val_images_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/images.npy
+    val_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/data.p
+    probe_targets: 'locations'
+    diff_targets: 'obs_component'
+    locations:
+      arch: 'conv'
+      subclass: 'c'
+      extract_field: 'obs_component'
+    l2_locations:
+      arch: 'conv'
+      subclass: 'c'
+      extract_field: 'obs_component'
+    l2_probe_targets: 'locations'
+    probe_mpc: false
+    probe_wall: false
+    probe_proprio: false
+    probe_encoder: false
+    probe_preds: false
+    # 仅为保留规划所需的 prober 对象；规划阶段 probe_depth=false，不使用它
+    epochs: 1
+    epochs_enc: 1
+    epochs_latent: 1
+    max_samples: 20000
+    max_samples_enc: 20000
+    full_finetune: false
+    lr: 0.0032
+    schedule: Cosine
+    visualize_probing: false
+    load_prober: false
+  h_d4rl_planning:
+    env_name: *env_name
+    n_envs: 85
+    n_steps: 192
+    final_trans_norm_cutoff: 4
+    final_trans_steps: 15
+    mock_l1: false
+    # 每个分片进程 5 个环境；8 个分片恰好覆盖官方 hard 的 40 个 trial
+    n_envs_batch_size: 5
+    seed: 42
+    error_threshold: 1.0
+    visualize_planning: false
+    plot_every: 16
+    action_repeat: 4
+    action_repeat_mode: 'id'
+    img_size: 98
+    replan_every: 4
+    image_obs: true
+    stack_states: 1
+    data_path: "${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/"
+    level1:
+      planner_type: PlannerType.MPPI
+      min_step: 0
+      max_step: 1
+      repr_target: true
+      sum_all_diffs: true
+      loss_coeff_first: 1
+      loss_coeff_last: 1
+      max_plan_length: 128
+      sgd:
+        action_change_reg: 0
+        l2_reg: 0
+        lr: 0.03
+        n_iters: 200
+      mppi:
+        noise_sigma: 5
+        num_samples: 500
+        lambda_: 0.0025
+        z_reg_coeff: 0
+    level2:
+      planner_type: PlannerType.MPPI
+      min_step: -2.5
+      max_step: 2.5
+      min_plan_length: 3
+      max_plan_length: 18
+      repr_target: true
+      sum_all_diffs: true
+      depth_probe_threshold: 25
+      probe_depth: false
+      sum_last_n: 3
+      mppi:
+        noise_sigma: 10
+        num_samples: 2000
+        lambda_: 0.0025
+        z_reg_coeff: 0.1
+    levels: "hard"
+    easy:
+      n_steps: 500
+      n_envs: 40
+      max_plan_length: 50
+      max_plan_length_l2: 25
+      plot_every: 10
+      min_block_radius: 4
+      max_block_radius: 9999
+      override_config: true
+      set_start_target_path: "${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/starts_targets_5_8.pt"
+      level1:
+        mppi:
+          num_samples: 500
+      level2:
+        mppi:
+          num_samples: 2000
+    medium:
+      n_steps: 500
+      n_envs: 40
+      max_plan_length: 50
+      max_plan_length_l2: 35
+      plot_every: 10
+      min_block_radius: 4
+      max_block_radius: 9999
+      override_config: true
+      set_start_target_path: "${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/starts_targets_9_12.pt"
+      level1:
+        mppi:
+          num_samples: 500
+      level2:
+        mppi:
+          num_samples: 2000
+    hard:
+      n_steps: 500
+      n_envs: 5
+      max_plan_length: 50
+      max_plan_length_l2: 47
+      plot_every: 10
+      min_block_radius: 4
+      max_block_radius: 9999
+      override_config: true
+      set_start_target_path: "${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/starts_targets_13_16_shard0.pt"
+      level1:
+        mppi:
+          num_samples: 1000
+      level2:
+        mppi:
+          num_samples: 4000
+    position_only: true
+quick_debug: false
+run_group: l2_large_diverse_25maps_wo_encoder
+run_name: hard_hwm_eval
+run_project: l2-HJEPA-maze-v3
+save_every_n_epochs: 1
+seed: 246
+wandb: false

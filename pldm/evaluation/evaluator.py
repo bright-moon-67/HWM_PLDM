@@ -291,6 +291,7 @@ class Evaluator:
 
         mpc_config = dataclasses.replace(
             self.h_planning_config,
+            level=level,
             n_envs=n_envs,
             n_steps=n_steps,
             level2=planner_config_l2,

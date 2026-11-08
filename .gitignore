@@ -6,6 +6,7 @@ checkpoint/
 *__pycache__*
 *.ipynb_checkpoints/
 *.npz
+*.db
 scripts/submit_multiple_jobs.py
 pldm/pretrained/
 pldm_envs/diverse_maze/datasets

@@ -2,7 +2,7 @@ n_steps: &n_steps 15
 val_n_steps: *n_steps
 env_name: &env_name maze2d_large_diverse
 compile_model: False
-root_path: &root_path /scratch/wz1232/HWM_PLDM
+root_path: &root_path /root/autodl-tmp/.autodl
 
 base_lr: 0.017632900482959527
 data:
@@ -19,7 +19,7 @@ data:
     batch_size: 128
     beta: 0.4
     crop_length: null
-    images_path: /scratch/wz1232/data/maze2d_large_diverse_25maps/images.npy
+    images_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_25maps/images.npy
     path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_25maps/data.p
     location_only: false
     num_workers: 10
@@ -107,9 +107,9 @@ eval_cfg:
   eval_l1: true
   probing:
     l1_depth: *n_steps
-    train_images_path: /scratch/wz1232/data/maze2d_large_diverse_probe/images.npy
+    train_images_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/images.npy
     train_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/data.p
-    val_images_path: /scratch/wz1232/data/maze2d_large_diverse_probe/images.npy
+    val_images_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/images.npy
     val_path: ${root_path}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_probe/data.p
     probe_targets: 'locations'
     diff_targets: 'obs_component'
