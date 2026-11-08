@@ -96,6 +96,78 @@ def _dig(mapping: Any, *keys: str, default: Any = None) -> Any:
     return current
 
 
+def _stack_steps(history: Any, n_envs: int) -> Optional[List[List[Optional[float]]]]:
+    """Turn a per-step history into one column per environment.
+
+    ``history`` holds one entry per environment step; each entry is a
+    tensor/array of shape ``(n_envs,)`` (or a scalar for a single environment).
+    Returns ``None`` when the history is missing or empty.
+    """
+    if history is None:
+        return None
+    try:
+        entries = list(history)
+    except TypeError:
+        return None
+    if not entries:
+        return None
+
+    columns: List[List[Optional[float]]] = [[] for _ in range(n_envs)]
+    for entry in entries:
+        values = _as_list(entry)
+        if values is None:
+            return None
+        if not isinstance(values, list):
+            values = [values]
+        if len(values) == 1 and n_envs > 1:
+            values = values * n_envs
+        for env in range(n_envs):
+            value = values[env] if env < len(values) else None
+            if isinstance(value, list):  # (1,)-shaped payloads
+                value = value[0] if value else None
+            columns[env].append(
+                float(value) if isinstance(value, (int, float)) else None
+            )
+    return columns
+
+
+def _episode_stats(result: Any, n_envs: int) -> Dict[str, List[Any]]:
+    """Per-environment episode return, final distance and first success step."""
+    rewards = _stack_steps(_field(result, "reward_history"), n_envs)
+    success = _stack_steps(_field(result, "success_history"), n_envs)
+    dists = _stack_steps(_field(result, "final_preds_dist"), n_envs)
+
+    out: Dict[str, List[Any]] = {
+        "return": [None] * n_envs,
+        "final_dist": [None] * n_envs,
+        "success_step": [None] * n_envs,
+        "episode_len": [None] * n_envs,
+    }
+    for env in range(n_envs):
+        if rewards is not None:
+            values = [v for v in rewards[env] if v is not None]
+            out["return"][env] = float(sum(values)) if values else None
+            out["episode_len"][env] = len(rewards[env])
+        if dists is not None:
+            values = [v for v in dists[env] if v is not None]
+            out["final_dist"][env] = float(values[-1]) if values else None
+        if success is not None:
+            step = None
+            for index, flag in enumerate(success[env]):
+                if flag:
+                    step = index
+                    break
+            out["success_step"][env] = step
+        if out["success_step"][env] is None and rewards is not None:
+            # maze2d pays a positive reward from the step the goal is reached
+            # on, which is the time-to-goal the reports do not store.
+            for index, value in enumerate(rewards[env]):
+                if value is not None and value > 0.0:
+                    out["success_step"][env] = index
+                    break
+    return out
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -155,6 +227,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         block_dists = _as_list(_field(report, "block_dists"))
 
         config = _load_yaml(shard_dir / "config.yaml")
+        result_path = shard_dir / f"planning_l2_mpc_result_{prefix}"
+        episode_stats = None
+        if result_path.exists():
+            try:
+                episode_stats = _episode_stats(
+                    _torch_load(result_path), len(success)
+                )
+            except Exception as exc:  # pragma: no cover - corrupt result file
+                print(
+                    f"WARNING: could not derive return for {result_path}: {exc}",
+                    file=sys.stderr,
+                )
+                episode_stats = None
+
         trials_path = args.trials or _dig(
             config, "eval_cfg", "h_d4rl_planning", "hard", "set_start_target_path"
         )
@@ -197,6 +283,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             if maps is not None and local_idx < len(maps):
                 record["map_hash"] = _map_hash(maps[local_idx])
+            if episode_stats is not None:
+                for key in ("return", "final_dist", "success_step", "episode_len"):
+                    record[key] = episode_stats[key][local_idx]
             if starts is not None and local_idx < len(starts):
                 record["start"] = [float(x) for x in list(starts[local_idx])[:2]]
             if targets is not None and local_idx < len(targets):
@@ -219,6 +308,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     total = len(records)
     total_success = sum(r["success"] for r in records)
+
+    def _mean(key: str) -> Optional[float]:
+        values = [r[key] for r in records if r.get(key) is not None]
+        return (sum(values) / len(values)) if values else None
+
+    def _mean_of(values: List[float]) -> Optional[float]:
+        return (sum(values) / len(values)) if values else None
+
     summary = {
         "run_tag": args.run_tag,
         "run_root": str(run_root),
@@ -226,6 +323,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         "num_tasks": total,
         "num_success": total_success,
         "success_rate": (total_success / total) if total else None,
+        # Return is the undiscounted sum of environment rewards per episode.
+        "mean_return": _mean("return"),
+        "mean_return_success": (
+            _mean_of([r["return"] for r in records if r["success"] and r.get("return") is not None])
+        ),
+        "mean_final_dist": _mean("final_dist"),
+        "success_by_200": sum(
+            1
+            for r in records
+            if r.get("success_step") is not None and r["success_step"] < 200
+        ),
+        "success_by_500": sum(
+            1
+            for r in records
+            if r.get("success_step") is not None and r["success_step"] < 500
+        ),
         "per_shard": per_shard,
         "missing": missing,
         "task_ids": task_ids,
