@@ -33,7 +33,13 @@ REPAIR_MODE=${REPAIR_MODE:-reselection}
 RESAMPLE=${RESAMPLE:-1}
 REPAIR_TOP_K=${REPAIR_TOP_K:-4}
 FEEDBACK=${FEEDBACK:-0}
+HIGH_FEEDBACK=${HIGH_FEEDBACK:-0}
+FB_TRIGGER=${FB_TRIGGER:-0}
+FB_THRESHOLD=${FB_THRESHOLD:-0.05}
 REPAIR_DEBUG=${REPAIR_DEBUG:-0}
+# N_ENVS > 1 takes the first N_ENVS tasks of the shard instead of slicing one
+# out of it; used to smoke-test batch-dependent code paths.
+N_ENVS=${N_ENVS:-1}
 LOGDIR=${LOGDIR:-${ROOT_DIR}/logs}
 CONFIG=${CONFIG:-configs/diverse_maze/icml/hard_hwm_exec.yaml}
 
@@ -78,10 +84,15 @@ single = {
     for key, value in trials.items()
 }
 torch.save(single, dst)
-print(f"wrote {dst} (task local index {idx})")
 PY
 
-echo "TASK_ID=${TASK_ID} SHARD=${SHARD} LOCAL_IDX=${LOCAL_IDX} N_STEPS=${N_STEPS}" \
+if [ "${N_ENVS}" -gt 1 ]; then
+    TRIALS_USED="${TRIALS}"
+else
+    TRIALS_USED="${TRIALS_SINGLE}"
+fi
+
+echo "TASK_ID=${TASK_ID} SHARD=${SHARD} N_ENVS=${N_ENVS} N_STEPS=${N_STEPS}" \
      "RETRY=${RETRY_BOOL} THRESHOLD=${THRESHOLD} RUN_TAG=${RUN_TAG}"
 
 cd "${ROOT_DIR}/pldm"
@@ -93,10 +104,10 @@ python train.py --configs "${CONFIG}" --values \
     data.d4rl_config.num_workers=0 \
     eval_cfg.l2_latent_bounds_percentile=0 \
     eval_cfg.probing.max_samples=2000 \
-    eval_cfg.h_d4rl_planning.hard.n_envs=1 \
-    eval_cfg.h_d4rl_planning.n_envs_batch_size=1 \
+    eval_cfg.h_d4rl_planning.hard.n_envs="${N_ENVS}" \
+    eval_cfg.h_d4rl_planning.n_envs_batch_size="${N_ENVS}" \
     eval_cfg.h_d4rl_planning.hard.n_steps="${N_STEPS}" \
-    eval_cfg.h_d4rl_planning.hard.set_start_target_path="${TRIALS_SINGLE}" \
+    eval_cfg.h_d4rl_planning.hard.set_start_target_path="${TRIALS_USED}" \
     output_dir="${RUN_TAG}" \
     seed=$((246 + SHARD)) \
     eval_cfg.h_d4rl_planning.seed=$((42 + SHARD)) \
@@ -111,5 +122,8 @@ python train.py --configs "${CONFIG}" --values \
     eval_cfg.h_d4rl_planning.exec_repair.high_resample_count="${RESAMPLE}" \
     eval_cfg.h_d4rl_planning.exec_repair.repair_top_k="${REPAIR_TOP_K}" \
     eval_cfg.h_d4rl_planning.exec_repair.exec_feedback_enabled="${FEEDBACK_BOOL}" \
+    eval_cfg.h_d4rl_planning.exec_repair.high_feedback_enabled=$([ "${HIGH_FEEDBACK}" = "1" ] && echo true || echo false) \
+    eval_cfg.h_d4rl_planning.exec_repair.repair_trigger_from_feedback=$([ "${FB_TRIGGER}" = "1" ] && echo true || echo false) \
+    eval_cfg.h_d4rl_planning.exec_repair.feedback_trigger_threshold="${FB_THRESHOLD}" \
     eval_cfg.h_d4rl_planning.exec_repair.repair_raise_errors=$([ "${REPAIR_DEBUG}" = "1" ] && echo true || echo false) \
     > "${LOGDIR}/${RUN_TAG}.log" 2>&1

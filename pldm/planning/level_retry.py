@@ -107,14 +107,31 @@ def snapshot_low_level_state(planner: Any) -> Dict[str, Any]:
     ctrls = getattr(planner, "ctrls", None)
     if ctrls is not None:
         ctrl_states = []
+        ctrl_samples = []
         for ctrl in ctrls:
             warm_start = getattr(ctrl, "U", None)
             ctrl_states.append(
                 warm_start.detach().clone() if torch.is_tensor(warm_start) else None
             )
+            # Step 4 reads the last MPPI search samples (``perturbed_action`` /
+            # ``cost_total``). They belong to the same planning call as ``U``, so
+            # they have to be restored together, otherwise a rejected retry
+            # leaves the *selected* plan paired with the *rejected* search's
+            # reachable-candidate set.
+            samples = {
+                "perturbed_action": getattr(ctrl, "perturbed_action", None),
+                "cost_total": getattr(ctrl, "cost_total", None),
+            }
+            ctrl_samples.append(
+                {
+                    key: (value.detach().clone() if torch.is_tensor(value) else None)
+                    for key, value in samples.items()
+                }
+            )
 
     return {
         "ctrl_states": ctrl_states,
+        "ctrl_samples": ctrl_samples if ctrls is not None else None,
         "last_plan_size": getattr(planner, "last_plan_size", None),
         "cpu_rng": torch.get_rng_state(),
         "cuda_rng": (
@@ -153,6 +170,11 @@ def restore_low_level_state(
         for i in indices:
             if i < len(saved) and saved[i] is not None and hasattr(ctrls[i], "U"):
                 ctrls[i].U = saved[i].clone()
+            samples = snapshot.get("ctrl_samples")
+            if samples is not None and i < len(samples):
+                for key, value in samples[i].items():
+                    if value is not None:
+                        setattr(ctrls[i], key, value.clone())
 
     if "last_plan_size" in snapshot:
         planner.last_plan_size = snapshot["last_plan_size"]

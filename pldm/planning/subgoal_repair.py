@@ -193,12 +193,17 @@ def build_reachable_candidates(
     dynamics = low_planner.dynamics
     predictor = dynamics.model.predictor
     steps = actions.shape[2]
+    # ``reshape`` below flattens in candidate-major order:
+    #   candidate0-env0, candidate0-env1, candidate1-env0, candidate1-env1, ...
+    # so the conditioning tensors must be expanded the same way (repeat, not
+    # repeat_interleave, which would be environment-major and mis-pair states
+    # with actions as soon as batch_size > 1).
     flat_actions = actions.reshape(k * batch_size, steps, -1).permute(1, 0, 2)
 
     def _repeat(tensor):
         if tensor is None:
             return None
-        return tensor.repeat_interleave(k, dim=0)
+        return tensor.repeat(k, *([1] * (tensor.dim() - 1)))
 
     with torch.no_grad():
         out = dynamics(
@@ -210,7 +215,9 @@ def build_reachable_candidates(
             only_return_last=True,
             flatten_output=False,
         )
-    terminal = out.obs_component.detach().view(batch_size * k, *out.obs_component.shape[1:])
+    terminal = out.obs_component.detach().view(
+        batch_size * k, *out.obs_component.shape[1:]
+    )
     terminal = terminal.view(k, batch_size, *terminal.shape[1:])
     return ReachableCandidates(states=terminal, actions=actions, costs=costs)
 
@@ -328,30 +335,26 @@ def plan_with_high_level_reselection(
     cfg: Any,
     subgoal_index: int = 1,
     lambda_vector: Optional[torch.Tensor] = None,
+    trigger_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[PlanningResult, PlanningResult, Optional[RepairInfo]]:
     """Re-search the L2 plan and keep the most low-level-reachable candidate.
 
     ``metrics_fn(l1_result, l2_result)`` returns the same cross-level metrics as
-    the diagnostic path (must contain ``cross_mse``).
+    the diagnostic path (must contain ``cross_mse``, ideally ``pred_progress_h``).
 
-    Selection (step 5) minimises the *normalised* combination
+    Selection (step 5):
 
-        score = J_H_norm + lambda * C_L_norm
+    1. a candidate is *feasible* if the low level predicts progress towards its
+       own subgoal (``repair_min_pred_progress``) and its cross-level gap is
+       below ``repair_max_cross_mse`` (when set);
+    2. among feasible candidates, minimise the normalised combination
+       ``J_H_norm + lambda * C_L_norm``.
 
-    where ``J_H`` is the high-level plan cost (distance of the L2 plan terminal to
-    the L2 goal) and ``C_L`` is the low-level reachability cost (cross-level gap
-    of the L1 plan towards the candidate subgoal). Both terms live on different
-    scales, so each is min-max normalised across the candidates of the same
-    environment before they are added - adding raw costs would be meaningless.
+    Requiring feasibility instead of "the gap must improve" avoids rejecting a
+    globally better detour just because its terminal gap is not smaller.
 
-    ``lambda_vector`` (``(B,)``) is the per-environment weight, normally produced
-    by :class:`pldm.planning.exec_feedback.ExecutionFeedback`. When ``None`` the
-    constant ``cfg.high_level_cost_weight`` is used.
-
-    Acceptance additionally requires that the selected candidate does not make
-    the low-level reachability worse than the plan we already have
-    (``gap_sel <= gap_before + cfg.repair_gap_tolerance``), so a better global
-    cost can never justify a clearly unreachable subgoal.
+    ``lambda_vector`` (``(B,)``) is the per-environment weight. When ``None``
+    the constant ``cfg.high_level_cost_weight`` is used.
     """
     gap_before = l1_first_metrics["cross_mse"].detach()
     n_candidates = int(getattr(cfg, "high_resample_count", 2) or 0)
@@ -363,6 +366,10 @@ def plan_with_high_level_reselection(
         subgoal_index=subgoal_index,
         enabled=bool(getattr(cfg, "repair_enabled", False)) and n_candidates > 0,
     )
+    if trigger_mask is not None:
+        triggered = triggered & trigger_mask.to(
+            device=gap_before.device, dtype=torch.bool
+        )
     if triggered.numel() == 0 or not bool(triggered.any()):
         return l1_first_result, l2_first_result, None
 
@@ -389,6 +396,9 @@ def plan_with_high_level_reselection(
     # is not used again inside this planning call and is reset at the next
     # replan, so it cannot leak into execution.
     candidate_gaps: List[torch.Tensor] = [gap_before]
+    candidate_progress: List[Optional[torch.Tensor]] = [
+        _metric_or_none(l1_first_metrics, "pred_progress_h")
+    ]
     candidate_l1: List[PlanningResult] = [l1_first_result]
     candidate_l2: List[PlanningResult] = [l2_first_result]
     candidate_jh: List[Optional[torch.Tensor]] = [
@@ -402,8 +412,21 @@ def plan_with_high_level_reselection(
     ]
 
     start = time.time()
+    independent = bool(getattr(cfg, "high_resample_independent", True))
     try:
         for _ in range(n_candidates):
+            if independent:
+                # Re-sample from the *same* pre-repair warm starts so each
+                # candidate is an independent draw instead of a refinement of
+                # the previous candidate (review 3, step 5). The RNG is *not*
+                # rewound here on purpose: rewinding would make every candidate
+                # draw the same MPPI noise and therefore produce the same plan.
+                restore_low_level_state(
+                    h_planner.l2_planner, snapshots[0]["l2"], restore_rng=False
+                )
+                restore_low_level_state(
+                    h_planner.l1_planner, snapshots[0]["l1"], restore_rng=False
+                )
             l2_candidate = h_planner.l2_planner.plan(**l2_plan_kwargs)
             h_planner.l1_planner.reset_targets(
                 l2_candidate.pred_obs[subgoal_index].detach(), repr_input=True
@@ -416,6 +439,9 @@ def plan_with_high_level_reselection(
             candidate_l2.append(l2_candidate)
             candidate_jh.append(
                 _high_level_goal_distance(h_planner.l2_planner, l2_candidate)
+            )
+            candidate_progress.append(
+                _metric_or_none(candidate_metrics, "pred_progress_h")
             )
             snapshots.append(
                 {
@@ -435,11 +461,30 @@ def plan_with_high_level_reselection(
         raise
 
     gaps = torch.stack(candidate_gaps, dim=0)  # (K, B)
-    scores = _combined_scores(gaps, candidate_jh, lam)  # (K, B)
+    scores = _combined_scores(
+        gaps,
+        candidate_jh,
+        lam,
+        mode=str(getattr(cfg, "repair_normalize_mode", "baseline")),
+    )  # (K, B)
+
+    # Feasibility gate: a candidate is only considered if the low level predicts
+    # progress towards its own subgoal (and, optionally, a hard gap cap). This
+    # replaces "the terminal gap must improve", which rejected necessary detours.
+    feasible = _feasibility_mask(
+        candidate_progress,
+        gaps,
+        min_progress=float(getattr(cfg, "repair_min_pred_progress", 0.0)),
+        max_gap=float(getattr(cfg, "repair_max_cross_mse", 0.0)),
+    )
+    feasible[0] = False  # candidate 0 is the fallback, never a "repair"
 
     masked = scores.clone()
-    masked[:, ~triggered] = float("inf")
+    masked[~feasible] = float("inf")
     selected = masked.argmin(dim=0)  # (B,)
+    finite = torch.isfinite(masked.gather(0, selected.view(1, -1)).squeeze(0))
+    selected = torch.where(finite, selected, torch.zeros_like(selected))
+
     selected_gap = gaps.gather(0, selected.view(1, -1)).squeeze(0)
     selected_score = scores.gather(0, selected.view(1, -1)).squeeze(0)
     score_before = scores[0]
@@ -447,6 +492,7 @@ def plan_with_high_level_reselection(
     reachable_ok = selected_gap <= (gap_before + gap_tolerance)
     accepted = (
         triggered
+        & finite
         & reachable_ok
         & ((gap_before - selected_gap) > min_improvement)
         & (selected_score < score_before)
@@ -536,16 +582,59 @@ def _minmax_per_env(values: torch.Tensor) -> torch.Tensor:
     return (values - vmin) / (vmax - vmin).clamp_min(1e-8)
 
 
+def _baseline_per_env(values: torch.Tensor) -> torch.Tensor:
+    """Normalise ``(K, B)`` values by candidate 0 (the plan we already have).
+
+    With only 2-3 candidates min-max would stretch tiny differences to 0 and 1,
+    which makes the score scale jump between decisions. Dividing by the baseline
+    keeps the scale comparable across decisions.
+    """
+    base = values[0:1].abs().clamp_min(1e-8)
+    return values / base
+
+
+def _normalize(values: torch.Tensor, mode: str) -> torch.Tensor:
+    if str(mode).lower() == "minmax":
+        return _minmax_per_env(values)
+    return _baseline_per_env(values)
+
+
+def _metric_or_none(metrics: Dict[str, Any], key: str) -> Optional[torch.Tensor]:
+    value = metrics.get(key) if metrics else None
+    return value.detach() if torch.is_tensor(value) else None
+
+
+def _feasibility_mask(
+    progress: List[Optional[torch.Tensor]],
+    gaps: torch.Tensor,
+    *,
+    min_progress: float,
+    max_gap: float,
+) -> torch.Tensor:
+    """``(K, B)`` bool: candidate reaches its own subgoal well enough to be used."""
+    feasible = torch.ones_like(gaps, dtype=torch.bool)
+    if min_progress > 0.0:
+        if all(p is not None for p in progress):
+            stacked = torch.stack(progress, dim=0)
+            feasible = feasible & (stacked >= float(min_progress))
+        # Without a progress signal every candidate would be rejected, so the
+        # check is skipped rather than silently disabling the branch.
+    if max_gap > 0.0:
+        feasible = feasible & (gaps <= float(max_gap))
+    return feasible
+
+
 def _combined_scores(
     gaps: torch.Tensor,
     high_level_costs: List[Optional[torch.Tensor]],
     lam: torch.Tensor,
+    mode: str = "baseline",
 ) -> torch.Tensor:
     """``score = J_H_norm + lambda * C_L_norm`` with both terms normalised."""
-    low = _minmax_per_env(gaps)
+    low = _normalize(gaps, mode)
     if any(cost is None for cost in high_level_costs):
         return low
-    high = _minmax_per_env(torch.stack(high_level_costs, dim=0))
+    high = _normalize(torch.stack(high_level_costs, dim=0), mode)
     lam = lam.to(device=low.device, dtype=low.dtype).view(1, -1)
     return high + lam * low
 
@@ -562,6 +651,7 @@ def plan_with_reachable_projection(
     objective: Any,
     cfg: Any,
     subgoal_index: int = 1,
+    trigger_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[PlanningResult, Optional[RepairInfo]]:
     """Step 4: project the high-level subgoal onto low-level reachable states.
 
@@ -587,6 +677,10 @@ def plan_with_reachable_projection(
         subgoal_index=subgoal_index,
         enabled=bool(getattr(cfg, "repair_enabled", False)),
     )
+    if trigger_mask is not None:
+        triggered = triggered & trigger_mask.to(
+            device=gap_before.device, dtype=torch.bool
+        )
     if triggered.numel() == 0 or not bool(triggered.any()):
         return l1_first_result, None
 
@@ -639,7 +733,15 @@ def plan_with_reachable_projection(
             pass
 
     repaired_gap = repaired_metrics["cross_mse"].detach()
-    accepted = triggered & ((gap_before - repaired_gap) > min_improvement)
+    # Only environments that actually found a reachable candidate may accept a
+    # repaired plan; the batch-level ``valid.any()`` check above is not enough
+    # because some environments can lack an admissible candidate.
+    accepted = (
+        triggered
+        & selection.valid.to(device=repaired_gap.device, dtype=torch.bool)
+        & torch.isfinite(repaired_gap)
+        & ((gap_before - repaired_gap) > min_improvement)
+    )
     accepted = accepted.to(dtype=torch.bool)
 
     if bool(accepted.any()):

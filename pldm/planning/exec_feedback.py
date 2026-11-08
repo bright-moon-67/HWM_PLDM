@@ -57,14 +57,23 @@ class ExecutionFeedback:
             raise ValueError("lambda_min must be <= lambda_max")
         self.device = device
         self.error_ema: Optional[torch.Tensor] = None
+        self.initialized: Optional[torch.Tensor] = None
         self.updates = 0
         if n_envs is not None:
             self.reset(n_envs)
 
     @classmethod
     def from_config(cls, cfg: Any, *, n_envs: Optional[int] = None, device=None):
-        """Build from ``ExecRepairConfig``; returns ``None`` when disabled."""
-        if cfg is None or not bool(getattr(cfg, "exec_feedback_enabled", False)):
+        """Build from ``ExecRepairConfig``; returns ``None`` when disabled.
+
+        Both the master switch and the step-6 switch must be on, otherwise
+        disabling the research line would still pay for the feedback bookkeeping.
+        """
+        if (
+            cfg is None
+            or not bool(getattr(cfg, "enabled", False))
+            or not bool(getattr(cfg, "exec_feedback_enabled", False))
+        ):
             return None
         return cls(
             beta=float(getattr(cfg, "feedback_beta", 0.1)),
@@ -78,15 +87,19 @@ class ExecutionFeedback:
     # ------------------------------------------------------------------ state
     def reset(self, n_envs: int) -> None:
         self.error_ema = torch.zeros(int(n_envs), dtype=torch.float32)
+        self.initialized = torch.zeros(int(n_envs), dtype=torch.bool)
         if self.device is not None:
             self.error_ema = self.error_ema.to(self.device)
+            self.initialized = self.initialized.to(self.device)
         self.updates = 0
 
     def _ensure(self, batch_size: int, device=None) -> torch.Tensor:
         if self.error_ema is None or self.error_ema.numel() != batch_size:
             self.error_ema = torch.zeros(batch_size, dtype=torch.float32)
+            self.initialized = torch.zeros(batch_size, dtype=torch.bool)
         if device is not None and self.error_ema.device != device:
             self.error_ema = self.error_ema.to(device)
+            self.initialized = self.initialized.to(device)
         return self.error_ema
 
     # ----------------------------------------------------------------- update
@@ -120,12 +133,20 @@ class ExecutionFeedback:
         if not bool(mask.any()):
             return ema
 
-        initialised = mask & (self.updates > 0)
-        fresh = mask & (self.updates == 0)
+        init = self.initialized
+        if init is None or init.numel() != errors.numel():
+            init = torch.zeros_like(mask)
+        init = init.to(device=errors.device)
+
+        # Per-environment initialisation: an environment whose first valid
+        # measurement arrives later must not be dragged towards zero.
+        initialised = mask & init
+        fresh = mask & ~init
         blended = (1.0 - self.beta) * ema + self.beta * errors
         ema = torch.where(initialised, blended, ema)
         ema = torch.where(fresh, errors, ema)
         self.error_ema = ema
+        self.initialized = init | mask
         self.updates += 1
         return ema
 
@@ -137,7 +158,14 @@ class ExecutionFeedback:
         n_envs: Optional[int] = None,
         device=None,
     ) -> torch.Tensor:
-        """``lambda_t = clip(lambda_0 * (1 + kappa * ema), min, max)`` per env."""
+        """``lambda_t = clip(lambda_0 * (1 + kappa * ema), min, max)`` per env.
+
+        Note (review 3): this scales the weight of a *world-model prediction*
+        (``C_feas``) by how wrong the world model has recently been, which is
+        conceptually backwards. It is kept only as an ablation
+        (``exec_repair.feedback_lambda_scale``) - the default behaviour uses the
+        feedback to decide *when* to repair, not how much to trust ``C_feas``.
+        """
         if n_envs is None:
             n_envs = (
                 self.error_ema.numel()
@@ -147,6 +175,19 @@ class ExecutionFeedback:
         ema = self._ensure(int(n_envs), device=device)
         weight = float(base_weight) * (1.0 + self.kappa * ema)
         return weight.clamp(self.lambda_min, self.lambda_max)
+
+    def model_trust(self, n_envs: Optional[int] = None, device=None) -> torch.Tensor:
+        """``U_exec``: how unreliable the low-level model has recently been.
+
+        Bounded to ``[0, 1]`` via ``ema / (1 + ema)`` so it can be compared and
+        thresholded without knowing the error scale exactly. It is constant
+        across the candidates of one environment, so it can gate *whether* to
+        repair but cannot re-rank candidates by itself.
+        """
+        ema = self._ensure(
+            int(n_envs) if n_envs is not None else 1, device=device
+        )
+        return ema / (1.0 + ema)
 
     @property
     def mean_error(self) -> float:
@@ -163,6 +204,7 @@ class ExecutionFeedback:
             "updates": self.updates,
             "mean_error": self.mean_error,
             "error_ema": self.error_ema,
+            "initialized": self.initialized,
         }
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper

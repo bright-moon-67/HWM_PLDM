@@ -671,8 +671,25 @@ class MPCEvaluator(ABC):
                         ),
                     )
                     # Step 6: feed the realised error back into the planner.
+                    # Only windows with a meaningful relative progress ratio are
+                    # used (review 3, step 1-2), so a tiny ``initial_dist``
+                    # cannot inject an extreme error estimate into the EMA.
                     if exec_feedback is not None and exec_metrics is not None:
-                        exec_feedback.update(exec_metrics.get("exec_mse_obs"))
+                        errors = exec_metrics.get("exec_mse_obs")
+                        if errors is not None:
+                            min_dist = float(
+                                getattr(
+                                    self._exec_cfg(),
+                                    "feedback_min_initial_dist",
+                                    0.0,
+                                )
+                                or 0.0
+                            )
+                            valid = torch.isfinite(errors)
+                            initial_dist = exec_metrics.get("initial_dist")
+                            if initial_dist is not None and min_dist > 0.0:
+                                valid = valid & (initial_dist >= min_dist)
+                            exec_feedback.update(errors, valid=valid)
                     pending_exec = None
 
                 if bilevel_planning:

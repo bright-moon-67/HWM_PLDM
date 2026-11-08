@@ -57,6 +57,19 @@ class ExecRepairConfig(ConfigBase):
     # Step 5: weight lambda_0 of the low-level reachability term in
     #   score = J_H_norm + lambda * C_L_norm
     high_level_cost_weight: float = 0.5
+    # How the two terms are put on a common scale:
+    #   "baseline" -> relative to candidate 0 (score = J/J0 + lambda * C/C0)
+    #   "minmax"   -> min-max across the (few) candidates of this decision
+    repair_normalize_mode: str = "baseline"
+    # Re-sample every high-level candidate from the *same* pre-repair warm start
+    # so the candidates are independent instead of being refined on top of each
+    # other ("sequential" keeps the old behaviour as an ablation).
+    high_resample_independent: bool = True
+    # Feasibility gate for step 5 (review 3): a candidate is admissible only if
+    # its predicted progress towards its own subgoal is at least this, and its
+    # cross-level gap is at most ``repair_max_cross_mse`` (<=0 disables).
+    repair_min_pred_progress: float = 0.0
+    repair_max_cross_mse: float = 0.0
     # Accept a repaired macro action only if it lowers the cross-level gap by
     # more than this amount.
     repair_min_improvement: float = 0.0
@@ -72,6 +85,18 @@ class ExecRepairConfig(ConfigBase):
     feedback_kappa: float = 1.0
     feedback_lambda_min: float = 0.1
     feedback_lambda_max: float = 10.0
+    # Review 3: scaling the weight of a *model prediction* by how unreliable the
+    # model has been is backwards. Off by default; keep it only as an ablation.
+    feedback_lambda_scale: bool = False
+    # Whether recent model unreliability gates/enables high-level repair.
+    repair_trigger_from_feedback: bool = False
+    # Threshold on ``U_exec = ema / (1 + ema)``. On hard mazes the execution
+    # error is O(0.1), i.e. ``U_exec`` ~ 0.05-0.1, so this default is low on
+    # purpose; calibrate it on a development split, never on the test set.
+    feedback_trigger_threshold: float = 0.05
+    # Execution windows with a smaller initial distance are ignored: the
+    # relative progress ratio is numerically meaningless there.
+    feedback_min_initial_dist: float = 1e-4
 
     # Step 5/6: re-rank high-level candidates with low-level feedback.
     high_feedback_enabled: bool = False

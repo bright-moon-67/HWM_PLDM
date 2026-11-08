@@ -221,6 +221,13 @@ eval_cfg:
       repair_min_progress: 0.0
       # score = J_H_norm + high_level_cost_weight * C_L_norm
       high_level_cost_weight: 0.5
+      # baseline = 以候选0为基准归一化（推荐）；minmax = 候选间 min-max（少候选时尺度跳变）
+      repair_normalize_mode: baseline
+      # true = 每条候选都从修复前的同一 warm start 重新采样（候选相互独立）
+      high_resample_independent: true
+      # 可执行性门槛：预测进展 >= 该值 且 cross_mse <= repair_max_cross_mse(<=0 关闭)
+      repair_min_pred_progress: 0.0
+      repair_max_cross_mse: 0.0
       repair_min_improvement: 0.0
       repair_gap_tolerance: 0.0
       repair_raise_errors: false
@@ -230,6 +237,12 @@ eval_cfg:
       feedback_kappa: 1.0
       feedback_lambda_min: 0.1
       feedback_lambda_max: 10.0
+      # 默认不让“模型越不准 → 越信任低层可执行性代价”，仅作消融开关
+      feedback_lambda_scale: false
+      # 用近期的执行失准程度决定“是否需要高层修复”
+      repair_trigger_from_feedback: false
+      feedback_trigger_threshold: 0.05
+      feedback_min_initial_dist: 0.0001
       subgoal_index: 1
       task_id_offset: 0
       output_dir: ""

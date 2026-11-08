@@ -70,13 +70,28 @@ class TwoLvlPlanner:
             and getattr(exec_cfg, "retry_enabled", False)
             and retry_configured
         )
-        # Step 4/5: high-level re-search, only after the low-level retry had its
-        # chance. Requires the same positive gap threshold as the retry.
+        # Step 4/5: repair the subgoal, only after the low-level retry had its
+        # chance. Requires the same positive gap threshold, and the cost knob
+        # that the *selected* mode actually uses (step 4 needs ``repair_top_k``,
+        # step 5 needs ``high_resample_count``) - they must be independent.
+        self.repair_mode = str(
+            getattr(exec_cfg, "repair_mode", "reselection") or "reselection"
+        ).lower()
+        self._projection_mode = self.repair_mode in (
+            "projection",
+            "reachable",
+            "reachable_projection",
+        )
+        mode_candidates = (
+            int(getattr(exec_cfg, "repair_top_k", 0) or 0)
+            if self._projection_mode
+            else int(getattr(exec_cfg, "high_resample_count", 0) or 0)
+        )
         self._repair_on = bool(
             self._research_on
             and getattr(exec_cfg, "repair_enabled", False)
             and retry_threshold > 0.0
-            and int(getattr(exec_cfg, "high_resample_count", 0) or 0) > 0
+            and mode_candidates > 0
         )
         self.last_retry_info = None
         self.last_repair_info = None
@@ -84,7 +99,6 @@ class TwoLvlPlanner:
         # In-process execution context (may contain large tensors such as the
         # projected subgoal). Never serialised to JSONL.
         self.last_exec_context = None
-        self.last_repair_info = None
 
     def _subgoal_index(self) -> int:
         """High-level subgoal index. Fixed to 1 unless the master switch is on."""
@@ -327,12 +341,11 @@ class TwoLvlPlanner:
                 progress_index=self.replan_every,
             )
 
-        mode = str(
-            getattr(self.exec_cfg, "repair_mode", "reselection") or "reselection"
-        ).lower()
+        mode = self.repair_mode
+        trigger_mask = self._repair_trigger_mask(batch_size)
 
         try:
-            if mode in ("projection", "reachable", "reachable_projection"):
+            if self._projection_mode:
                 merged, info = plan_with_reachable_projection(
                     h_planner=self,
                     backbone_output=backbone_output,
@@ -344,6 +357,7 @@ class TwoLvlPlanner:
                     objective=objective,
                     cfg=self.exec_cfg,
                     subgoal_index=subgoal_index,
+                    trigger_mask=trigger_mask,
                 )
                 return merged, l2_result, info
 
@@ -358,6 +372,7 @@ class TwoLvlPlanner:
                 cfg=self.exec_cfg,
                 subgoal_index=subgoal_index,
                 lambda_vector=self._repair_lambda(batch_size),
+                trigger_mask=trigger_mask,
             )
             return merged_l1, merged_l2, info
         except Exception:
@@ -367,11 +382,35 @@ class TwoLvlPlanner:
                 raise
             return l1_result, l2_result, None
 
-    def _repair_lambda(self, batch_size: int):
-        """Step 6: per-environment reachability weight, or ``None``."""
+    def _repair_trigger_mask(self, batch_size: int):
+        """Step 6 gate: repair only where the low-level model is unreliable.
+
+        ``U_exec`` (recent execution error) is constant across the candidates of
+        one environment, so it can decide *whether* to repair but not *which*
+        candidate to pick. That is exactly the separation review 3 asks for.
+        """
         feedback = self.exec_feedback
-        if feedback is None or not bool(
-            getattr(self.exec_cfg, "exec_feedback_enabled", False)
+        if (
+            feedback is None
+            or not bool(getattr(self.exec_cfg, "high_feedback_enabled", False))
+            or not bool(getattr(self.exec_cfg, "repair_trigger_from_feedback", False))
+        ):
+            return None
+        trust = feedback.model_trust(n_envs=batch_size)
+        threshold = float(getattr(self.exec_cfg, "feedback_trigger_threshold", 0.0))
+        return trust >= threshold
+
+    def _repair_lambda(self, batch_size: int):
+        """Ablation only: per-environment reachability weight, or ``None``.
+
+        Scaling ``C_feas`` by the model's own unreliability is questionable
+        (review 3), so this is off unless ``feedback_lambda_scale`` is set.
+        """
+        feedback = self.exec_feedback
+        if (
+            feedback is None
+            or not bool(getattr(self.exec_cfg, "high_feedback_enabled", False))
+            or not bool(getattr(self.exec_cfg, "feedback_lambda_scale", False))
         ):
             return None
         base = float(getattr(self.exec_cfg, "high_level_cost_weight", 0.5))

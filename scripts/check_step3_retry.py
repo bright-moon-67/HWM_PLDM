@@ -950,7 +950,16 @@ def v18_execution_feedback_ema_and_weight():
 
     off = ExecRepairConfig()
     assert ExecutionFeedback.from_config(off, n_envs=2) is None
-    on = ExecRepairConfig(exec_feedback_enabled=True, feedback_kappa=2.0)
+    # The master switch must gate the step-6 bookkeeping as well.
+    assert (
+        ExecutionFeedback.from_config(
+            ExecRepairConfig(enabled=False, exec_feedback_enabled=True), n_envs=2
+        )
+        is None
+    )
+    on = ExecRepairConfig(
+        enabled=True, exec_feedback_enabled=True, feedback_kappa=2.0
+    )
     built = ExecutionFeedback.from_config(on, n_envs=3)
     assert built is not None and built.kappa == 2.0
 
@@ -1105,6 +1114,246 @@ def v20_high_level_cost_weight_changes_selection():
     assert info.selected_candidate.tolist() == [2], info.selected_candidate
     assert info.high_level_cost_before is not None
     assert torch.allclose(info.lambda_used, torch.tensor([0.0]))
+
+
+# --------------------------------------------------------------------------- #
+# review 3 fixes
+# --------------------------------------------------------------------------- #
+class _PairingDynamics:
+    """Rolls candidates out as ``terminal = state + sum(action)`` per sample.
+
+    With a correct state/action pairing the terminal of sample ``i`` equals
+    ``state[env(i)] + action_mean[i]``; any mis-pairing shows up immediately.
+    """
+
+    def __init__(self):
+        import types
+
+        self.model = types.SimpleNamespace(predictor=_PairingPredictor())
+
+    def __call__(self, state, proprio, location, raw_location, action, **kw):
+        n = action.shape[1]
+        per_sample_action = action.sum(dim=0)  # (N, nu)
+        # state: (1, N, C, H, W) -> (N, C, H, W)
+        obs = torch.zeros(n, 3, 2, 2)
+        base = state[0][:, 0, 0, 0]  # first pixel of channel 0 per sample
+        obs[:, 0] = (
+            base.view(-1, 1, 1) + per_sample_action.mean(dim=-1).view(-1, 1, 1)
+        )
+        import types
+
+        return types.SimpleNamespace(obs_component=obs)
+
+
+class _PairingPredictor:
+    def _prepare_ensemble_input(self, x):
+        return None if x is None else x.unsqueeze(0)
+
+
+class _SampleCtrl:
+    def __init__(self, values, costs, nu=2, steps=4):
+        k = len(values)
+        self.perturbed_action = torch.tensor(values).view(k, 1, 1).repeat(1, steps, nu)
+        self.cost_total = torch.tensor(costs)
+
+
+class _SamplePlanner:
+    def __init__(self, ctrl):
+        self.ctrls = [ctrl]
+        self.dynamics = _PairingDynamics()
+
+
+@case
+def v21_candidate_states_and_actions_are_paired_for_batch_gt_1():
+    from pldm.planning.subgoal_repair import build_reachable_candidates
+
+    torch.manual_seed(0)
+    batch, k, steps, nu = 3, 2, 4, 2
+
+    ctrls = []
+    for env in range(batch):
+        # env-specific candidate values; env 0 and env 1 differ strongly.
+        values = [10.0 * (env + 1) + 1.0, 10.0 * (env + 1) + 2.0]
+        ctrls.append(_SampleCtrl(values, [0.1, 0.2], nu=nu, steps=steps))
+    planner = _SamplePlanner(ctrls[0])
+    planner.ctrls = ctrls
+
+    state = torch.zeros(batch, 3, 2, 2)
+    for env in range(batch):
+        state[env, 0] = float(env)  # identifiable per-env conditioning state
+
+    candidates = build_reachable_candidates(planner, state, top_k=k)
+    assert candidates.states.shape == (k, batch, 3, 2, 2)
+
+    # terminal(env, candidate) == state(env) + mean(action of that candidate)
+    for env in range(batch):
+        for cand in range(k):
+            expected = env + candidates.actions[cand, env].sum().item() / nu
+            got = candidates.states[cand, env, 0, 0, 0].item()
+            assert abs(got - expected) < 1e-4, (env, cand, got, expected)
+
+
+@case
+def v22_projection_acceptance_uses_valid_mask():
+    from pldm.planning import subgoal_repair
+
+    hierarchy = FakeHierarchy(n_envs=2)
+    cfg = RetryCfg(threshold=0.2, require_path_cost=False)
+    cfg.repair_enabled = True
+    cfg.repair_top_k = 2
+    cfg.repair_min_improvement = 0.0
+    cfg.repair_raise_errors = True
+
+    # env 0 has an admissible candidate, env 1 does not.
+    selection = subgoal_repair.ReachableSelection(
+        subgoal_l2=torch.zeros(2, 12),
+        subgoal_l2_map=torch.zeros(2, 3, 2, 2),
+        index=torch.tensor([1, 0]),
+        valid=torch.tensor([True, False]),
+        dist=torch.zeros(1, 2),
+        progress=torch.zeros(1, 2),
+    )
+
+    def fake_build(*args, **kwargs):
+        return subgoal_repair.ReachableCandidates(
+            states=torch.zeros(1, 2, 3, 2, 2),
+            actions=torch.zeros(1, 2, 4, 2),
+            costs=torch.zeros(1, 2),
+        )
+
+    def fake_select(*args, **kwargs):
+        return selection
+
+    saved = (
+        subgoal_repair.build_reachable_candidates,
+        subgoal_repair.select_reachable_subgoal,
+    )
+    subgoal_repair.build_reachable_candidates = fake_build
+    subgoal_repair.select_reachable_subgoal = fake_select
+    try:
+        # Repaired plan is better for BOTH envs; only env 0 may be accepted.
+        merged, info = subgoal_repair.plan_with_reachable_projection(
+            h_planner=hierarchy,
+            backbone_output=torch.zeros(2, 3, 2, 2),
+            l1_plan_kwargs={"plan_size": 4},
+            l1_first_result=make_result(0.0),
+            l1_first_metrics={"cross_mse": torch.tensor([0.50, 0.50])},
+            l2_result=make_result(0.0),
+            metrics_fn=lambda *_: {"cross_mse": torch.tensor([0.10, 0.10])},
+            objective=FakeObjective(FakeEncoder(False), None),
+            cfg=cfg,
+            subgoal_index=1,
+        )
+    finally:
+        (
+            subgoal_repair.build_reachable_candidates,
+            subgoal_repair.select_reachable_subgoal,
+        ) = saved
+
+    assert info is not None
+    assert info.triggered.tolist() == [True, True]
+    assert info.accepted.tolist() == [True, False], info.accepted
+    assert torch.all(merged.pred_obs[:, 0] == 1.0)  # repaired plan kept
+    assert torch.all(merged.pred_obs[:, 1] == 0.0)  # original plan kept
+
+
+@case
+def v23_retry_restores_mppi_sample_cache_per_env():
+    from pldm.planning.level_retry import (
+        restore_low_level_state,
+        snapshot_low_level_state,
+    )
+
+    planner = FakeLowPlanner(make_result(1.0))
+
+    class _SampleCtrl(FakeCtrl):
+        def __init__(self, u):
+            super().__init__(u)
+            self.perturbed_action = torch.full((3, 2, 2), 1.0)
+            self.cost_total = torch.ones(3)
+
+    planner.ctrls = [_SampleCtrl(torch.ones(2, 2)) for _ in range(2)]
+    snapshot = snapshot_low_level_state(planner)
+
+    # Simulate a second (rejected) search for env 1 only.
+    planner.ctrls[0].perturbed_action = torch.full((3, 2, 2), 9.0)
+    planner.ctrls[1].perturbed_action = torch.full((3, 2, 2), 9.0)
+    planner.ctrls[1].cost_total = torch.full((3,), 9.0)
+
+    restore_low_level_state(planner, snapshot, env_mask=torch.tensor([False, True]))
+    assert torch.all(planner.ctrls[0].perturbed_action == 9.0)  # accepted env keeps
+    assert torch.all(planner.ctrls[1].perturbed_action == 1.0)  # rejected env restored
+    assert torch.all(planner.ctrls[1].cost_total == 1.0)
+
+
+@case
+def v24_repair_gating_is_mode_dependent_and_feedback_gated():
+    # Projection needs repair_top_k; reselection needs high_resample_count.
+    proj = RetryCfg(threshold=0.2, require_path_cost=False)
+    proj.enabled = True
+    proj.repair_enabled = True
+    proj.repair_mode = "projection"
+    proj.repair_top_k = 4
+    proj.high_resample_count = 0
+    assert TwoLvlPlanner(None, None, 10, exec_cfg=proj)._repair_on is True
+
+    reselect = RetryCfg(threshold=0.2, require_path_cost=False)
+    reselect.enabled = True
+    reselect.repair_enabled = True
+    reselect.repair_mode = "reselection"
+    reselect.repair_top_k = 4
+    reselect.high_resample_count = 0
+    assert TwoLvlPlanner(None, None, 10, exec_cfg=reselect)._repair_on is False
+
+    # Feedback gating: repair only where the model has been unreliable.
+    from pldm.planning.exec_feedback import ExecutionFeedback
+
+    fb = ExecutionFeedback(n_envs=2)
+    fb.update(torch.tensor([0.0, 5.0]))  # U_exec: 0.0 vs 0.83
+    gated = RetryCfg(threshold=0.2, require_path_cost=False)
+    gated.enabled = True
+    gated.repair_enabled = True
+    gated.repair_mode = "reselection"
+    gated.high_resample_count = 1
+    gated.high_feedback_enabled = True
+    gated.repair_trigger_from_feedback = True
+    gated.feedback_trigger_threshold = 0.5
+    planner = TwoLvlPlanner(None, None, 10, exec_cfg=gated, exec_feedback=fb)
+    mask = planner._repair_trigger_mask(2)
+    assert mask.tolist() == [False, True], mask
+
+    # Without the feedback switch the gate is absent.
+    gated.repair_trigger_from_feedback = False
+    planner = TwoLvlPlanner(None, None, 10, exec_cfg=gated, exec_feedback=fb)
+    assert planner._repair_trigger_mask(2) is None
+    # ... and lambda scaling is off unless explicitly requested (review 3).
+    assert planner._repair_lambda(2) is None
+
+
+@case
+def v25_feasibility_gate_and_baseline_normalisation():
+    from pldm.planning.subgoal_repair import (
+        _combined_scores,
+        _feasibility_mask,
+        _normalize,
+    )
+
+    gaps = torch.tensor([[1.0], [2.0], [4.0]])
+    base = _normalize(gaps, "baseline")
+    assert torch.allclose(base[:, 0], torch.tensor([1.0, 2.0, 4.0]))
+    mm = _normalize(gaps, "minmax")
+    assert torch.allclose(mm[:, 0], torch.tensor([0.0, 1 / 3, 1.0]))
+
+    progress = [torch.tensor([0.5]), torch.tensor([0.1]), torch.tensor([0.9])]
+    feat = _feasibility_mask(
+        progress, gaps, min_progress=0.4, max_gap=3.0
+    )
+    # candidate 1: progress too low; candidate 2: gap too high; 0 passes.
+    assert feat[:, 0].tolist() == [True, False, False]
+
+    # Selection must ignore infeasible candidates even if they score best.
+    scores = _combined_scores(gaps, [None, None, None], torch.tensor([1.0]))
+    assert scores.shape == (3, 1)
 
 
 def main() -> int:
