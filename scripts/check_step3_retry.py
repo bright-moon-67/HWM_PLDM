@@ -29,6 +29,7 @@ import torch  # noqa: E402
 
 from pldm.planning.diagnostics import (  # noqa: E402
     cross_level_metrics,
+    execution_prediction_index,
     project_l1_encoding_to_l2,
 )
 from pldm.planning.level_retry import (  # noqa: E402
@@ -98,11 +99,13 @@ class RetryCfg:
         min_improvement: float = 0.0,
         min_improvement_ratio: float = 0.0,
         restore_rng_on_reject: bool = True,
+        require_path_cost: bool = True,
     ):
         self.retry_gap_threshold = threshold
         self.retry_min_improvement = min_improvement
         self.retry_min_improvement_ratio = min_improvement_ratio
         self.retry_restore_rng_on_reject = restore_rng_on_reject
+        self.retry_require_path_cost_improvement = require_path_cost
 
 
 class FakeCtrl:
@@ -192,7 +195,13 @@ def v1b_cross_level_metrics_shapes():
     l2_pred_obs = torch.randn(steps, batch, 3, 4, 4)
 
     metrics = cross_level_metrics(l1_pred_obs, l2_pred_obs, objective, subgoal_index=1)
-    for name in ("cross_mse", "cross_l2", "l2_subgoal_norm", "l1_terminal_norm"):
+    for name in (
+        "cross_mse",
+        "cross_l2",
+        "l2_subgoal_norm",
+        "l1_terminal_norm",
+        "path_cost",
+    ):
         assert metrics[name].shape == (batch,), (name, metrics[name].shape)
 
     try:
@@ -213,12 +222,15 @@ def v2_no_trigger_is_inert():
     rng_before = torch.get_rng_state()
     warm_before = [ctrl.U.clone() for ctrl in planner.ctrls]
 
+    def unexpected(_result):  # pragma: no cover
+        raise AssertionError("metrics_fn must not run when nothing is triggered")
+
     result, info = plan_with_retry(
         planner,
         {},
         first,
-        torch.tensor([0.1, 0.2]),
-        lambda _result: torch.zeros(2),
+        {"cross_mse": torch.tensor([0.1, 0.2])},
+        unexpected,
         RetryCfg(threshold=1.0),
     )
 
@@ -239,8 +251,14 @@ def v3_accept_all_keeps_retry():
         planner,
         {},
         first,
-        torch.tensor([0.5, 0.5]),
-        lambda _result: torch.tensor([0.1, 0.1]),
+        {
+            "cross_mse": torch.tensor([0.5, 0.5]),
+            "path_cost": torch.tensor([1.0, 1.0]),
+        },
+        lambda _result: {
+            "cross_mse": torch.tensor([0.1, 0.1]),
+            "path_cost": torch.tensor([0.5, 0.5]),
+        },
         RetryCfg(threshold=0.2),
     )
 
@@ -248,6 +266,7 @@ def v3_accept_all_keeps_retry():
     assert info.n_triggered == 2 and info.n_accepted == 2
     assert torch.all(result.pred_obs == 1.0)
     assert torch.all(result.actions == 1.0)
+    assert torch.allclose(info.path_cost_selected, torch.tensor([0.5, 0.5]))
     for ctrl in planner.ctrls:
         assert torch.all(ctrl.U == 2.0), ctrl.U
 
@@ -262,8 +281,14 @@ def v3b_reject_all_restores_state():
         planner,
         {},
         first,
-        torch.tensor([0.5, 0.5]),
-        lambda _result: torch.tensor([0.9, 0.9]),
+        {
+            "cross_mse": torch.tensor([0.5, 0.5]),
+            "path_cost": torch.tensor([1.0, 1.0]),
+        },
+        lambda _result: {
+            "cross_mse": torch.tensor([0.9, 0.9]),
+            "path_cost": torch.tensor([2.0, 2.0]),
+        },
         RetryCfg(threshold=0.2),
     )
 
@@ -273,8 +298,6 @@ def v3b_reject_all_restores_state():
     for ctrl in planner.ctrls:
         assert torch.all(ctrl.U == 1.0), ctrl.U
     assert planner.last_plan_size == 2
-    if torch.cuda.is_available():
-        pass  # CUDA RNG is restored too; CPU comparison below is the strict one
     assert torch.equal(torch.get_rng_state(), rng_before)
 
 
@@ -287,8 +310,14 @@ def v4_partial_accept_blends_per_env():
         planner,
         {},
         first,
-        torch.tensor([0.5, 0.5]),
-        lambda _result: torch.tensor([0.1, 0.9]),
+        {
+            "cross_mse": torch.tensor([0.5, 0.5]),
+            "path_cost": torch.tensor([1.0, 1.0]),
+        },
+        lambda _result: {
+            "cross_mse": torch.tensor([0.1, 0.9]),
+            "path_cost": torch.tensor([0.5, 2.0]),
+        },
         RetryCfg(threshold=0.2),
     )
 
@@ -299,6 +328,7 @@ def v4_partial_accept_blends_per_env():
     assert torch.all(planner.ctrls[0].U == 2.0)
     assert torch.all(planner.ctrls[1].U == 1.0)
     assert torch.allclose(info.gap_selected, torch.tensor([0.1, 0.5]))
+    assert torch.allclose(info.path_cost_selected, torch.tensor([0.5, 1.0]))
 
 
 @case
@@ -387,6 +417,82 @@ def v6b_two_level_planner_gating():
     threshold_zero.retry_enabled = True
     threshold_zero.subgoal_index = 1
     assert TwoLvlPlanner(None, None, 10, exec_cfg=threshold_zero)._retry_on is False
+
+
+@case
+def v7_subgoal_index_follows_master_switch():
+    off = RetryCfg(threshold=0.2)
+    off.enabled = False
+    off.retry_enabled = False
+    off.log_diagnostics = False
+    off.subgoal_index = 2
+    assert TwoLvlPlanner(None, None, 10, exec_cfg=off)._subgoal_index() == 1
+
+    on = RetryCfg(threshold=0.2)
+    on.enabled = True
+    on.retry_enabled = False
+    on.log_diagnostics = True
+    on.subgoal_index = 2
+    planner = TwoLvlPlanner(None, None, 10, exec_cfg=on)
+    assert planner._subgoal_index() == 2
+    assert planner.last_diagnostics is None
+
+
+@case
+def v8_diagnostic_only_does_not_retry():
+    cfg = RetryCfg(threshold=0.2)
+    cfg.enabled = True
+    cfg.log_diagnostics = True
+    cfg.retry_enabled = False
+    cfg.subgoal_index = 1
+    planner = TwoLvlPlanner(None, None, 10, exec_cfg=cfg)
+    assert planner._diag_on is True
+    assert planner._retry_on is False
+
+
+@case
+def v9_execution_alignment_index():
+    assert execution_prediction_index(4, 11) == 4
+    assert execution_prediction_index(1, 2) == 1
+    assert execution_prediction_index(4, 4) is None
+    assert execution_prediction_index(0, 11) is None
+
+
+@case
+def v10_path_cost_guard_can_reject_terminal_improvement():
+    first = make_result(0.0, batch=1)
+    first_metrics = {
+        "cross_mse": torch.tensor([0.5]),
+        "path_cost": torch.tensor([1.0]),
+    }
+    retry_metrics = {
+        "cross_mse": torch.tensor([0.1]),
+        "path_cost": torch.tensor([2.0]),
+    }
+
+    guarded = FakeLowPlanner(make_result(1.0, batch=1), n_envs=1)
+    result, info = plan_with_retry(
+        guarded,
+        {},
+        first,
+        first_metrics,
+        lambda _result: retry_metrics,
+        RetryCfg(threshold=0.2, require_path_cost=True),
+    )
+    assert info.n_accepted == 0 and result is first
+    assert torch.all(guarded.ctrls[0].U == 1.0)
+
+    unguarded = FakeLowPlanner(make_result(1.0, batch=1), n_envs=1)
+    result2, info2 = plan_with_retry(
+        unguarded,
+        {},
+        first,
+        first_metrics,
+        lambda _result: retry_metrics,
+        RetryCfg(threshold=0.2, require_path_cost=False),
+    )
+    assert info2.n_accepted == 1
+    assert torch.all(result2.pred_obs == 1.0)
 
 
 def main() -> int:

@@ -54,6 +54,9 @@ class RetryInfo:
     gap_after: torch.Tensor
     gap_selected: torch.Tensor
     wall_time_s: float
+    path_cost_before: Optional[torch.Tensor] = None
+    path_cost_after: Optional[torch.Tensor] = None
+    path_cost_selected: Optional[torch.Tensor] = None
 
     @property
     def n_triggered(self) -> int:
@@ -64,7 +67,7 @@ class RetryInfo:
         return int(self.accepted.sum().item())
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "triggered": self.triggered,
             "accepted": self.accepted,
             "gap_before": self.gap_before,
@@ -74,6 +77,15 @@ class RetryInfo:
             "n_triggered": self.n_triggered,
             "n_accepted": self.n_accepted,
         }
+        for name in (
+            "path_cost_before",
+            "path_cost_after",
+            "path_cost_selected",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                payload[name] = value
+        return payload
 
 
 def snapshot_low_level_state(planner: Any) -> Dict[str, Any]:
@@ -192,14 +204,22 @@ def plan_with_retry(
     planner: Any,
     plan_kwargs: Dict[str, Any],
     first_result: PlanningResult,
-    gap_before: torch.Tensor,
-    gap_fn: Callable[[PlanningResult], torch.Tensor],
+    first_metrics: Dict[str, torch.Tensor],
+    metrics_fn: Callable[[PlanningResult], Dict[str, torch.Tensor]],
     cfg: Any,
 ) -> Tuple[PlanningResult, RetryInfo]:
-    """Optionally re-plan with the low-level planner and keep per-env improvements."""
-    gap_before = gap_before.detach()
-    threshold = float(getattr(cfg, "retry_gap_threshold", 0.0))
+    """Optionally re-plan with the low-level planner and keep per-env improvements.
 
+    ``first_metrics`` / ``metrics_fn`` must provide ``cross_mse`` and should
+    provide ``path_cost``; the latter guards against accepting a retry that only
+    improves the terminal prediction while making the whole path worse.
+    """
+    gap_before = first_metrics["cross_mse"].detach()
+    path_before = first_metrics.get("path_cost")
+    if path_before is not None:
+        path_before = path_before.detach()
+
+    threshold = float(getattr(cfg, "retry_gap_threshold", 0.0))
     if threshold > 0.0:
         triggered = gap_before > threshold
     else:
@@ -215,15 +235,28 @@ def plan_with_retry(
             gap_after=gap_before,
             gap_selected=gap_before,
             wall_time_s=0.0,
+            path_cost_before=path_before,
+            path_cost_after=path_before,
+            path_cost_selected=path_before,
         )
 
     snapshot = snapshot_low_level_state(planner)
 
-    start = time.time()
-    retry_result = planner.plan(**plan_kwargs)
-    wall_time_s = time.time() - start
+    try:
+        start = time.time()
+        retry_result = planner.plan(**plan_kwargs)
+        wall_time_s = time.time() - start
+        retry_metrics = metrics_fn(retry_result)
+    except Exception:
+        # Leave no partially updated warm starts behind if the retry fails
+        # (OOM, shape errors, ...).
+        restore_low_level_state(planner, snapshot, restore_rng=True)
+        raise
 
-    gap_after = gap_fn(retry_result).detach()
+    gap_after = retry_metrics["cross_mse"].detach()
+    path_after = retry_metrics.get("path_cost")
+    if path_after is not None:
+        path_after = path_after.detach()
 
     improvement = gap_before - gap_after
     min_abs = float(getattr(cfg, "retry_min_improvement", 0.0))
@@ -233,6 +266,12 @@ def plan_with_retry(
     if min_ratio > 0.0:
         ratio = improvement / gap_before.clamp_min(1e-12)
         accepted = accepted & (ratio > min_ratio)
+    if (
+        bool(getattr(cfg, "retry_require_path_cost_improvement", False))
+        and path_before is not None
+        and path_after is not None
+    ):
+        accepted = accepted & (path_after <= path_before)
     accepted = accepted.to(dtype=torch.bool)
 
     merged = (
@@ -250,6 +289,11 @@ def plan_with_retry(
         restore_rng_state(snapshot)
 
     gap_selected = torch.where(accepted, gap_after, gap_before)
+    path_selected = (
+        torch.where(accepted, path_after, path_before)
+        if path_before is not None and path_after is not None
+        else None
+    )
     return merged, RetryInfo(
         triggered=triggered,
         accepted=accepted,
@@ -257,4 +301,7 @@ def plan_with_retry(
         gap_after=gap_after,
         gap_selected=gap_selected,
         wall_time_s=wall_time_s,
+        path_cost_before=path_before,
+        path_cost_after=path_after,
+        path_cost_selected=path_selected,
     )

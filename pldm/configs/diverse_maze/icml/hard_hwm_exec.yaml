@@ -202,6 +202,7 @@ eval_cfg:
       retry_min_improvement: 0.0
       retry_min_improvement_ratio: 0.0
       retry_restore_rng_on_reject: true
+      retry_require_path_cost_improvement: true
       subgoal_index: 1
       task_id_offset: 0
       output_dir: ""

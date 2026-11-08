@@ -286,20 +286,51 @@ def cross_level_metrics(
         )
 
     with torch.no_grad():
-        z_low = project_l1_encoding_to_l2(l1_pred_obs[-1], objective)
+        z_low_all = project_l1_encoding_to_l2(l1_pred_obs, objective)
         z_high = flatten_conv_output(l2_pred_obs[subgoal_index])
 
-    if z_low.shape != z_high.shape:
+    if z_low_all.dim() != 3:
+        raise RuntimeError(
+            "expected (T, B, D) projected L1 predictions, got "
+            f"{tuple(z_low_all.shape)}"
+        )
+    if z_low_all.shape[1:] != z_high.shape:
         raise RuntimeError(
             "cross-level representation mismatch: L1->L2 projection has shape "
-            f"{tuple(z_low.shape)} but the L2 subgoal has shape "
+            f"{tuple(z_low_all.shape[1:])} but the L2 subgoal has shape "
             f"{tuple(z_high.shape)}"
         )
 
+    z_low = z_low_all[-1]
     diff = z_low - z_high
+
+    # Path cost: same cross-level discrepancy accumulated over the whole L1
+    # horizon (excluding the current state), matching the spirit of
+    # ``ReprTargetMPCObjective`` with ``sum_all_diffs=True``.
+    if z_low_all.shape[0] > 1:
+        path_diff = z_low_all[1:] - z_high.unsqueeze(0)
+        path_cost = path_diff.pow(2).mean(dim=-1).sum(dim=0)
+    else:  # pragma: no cover - degenerate horizon
+        path_cost = torch.zeros_like(diff.pow(2).mean(dim=1))
+
     return {
         "cross_mse": diff.pow(2).mean(dim=1).detach(),
         "cross_l2": torch.linalg.vector_norm(diff, dim=1).detach(),
         "l2_subgoal_norm": torch.linalg.vector_norm(z_high, dim=1).detach(),
         "l1_terminal_norm": torch.linalg.vector_norm(z_low, dim=1).detach(),
+        "path_cost": path_cost.detach(),
     }
+
+
+def execution_prediction_index(
+    replan_every: int, num_pred_steps: int
+) -> Optional[int]:
+    """Index of the prediction that matches ``replan_every`` executed steps.
+
+    ``pred_obs``/``locations`` include the current state at index 0, so the
+    prediction after ``replan_every`` primitive steps lives at index
+    ``replan_every``. Returns ``None`` when the plan is too short.
+    """
+    if replan_every <= 0 or num_pred_steps <= replan_every:
+        return None
+    return int(replan_every)

@@ -31,19 +31,31 @@ class TwoLvlPlanner:
         # byte-for-byte identical to the baseline implementation.
         self.exec_cfg = exec_cfg
         self.chunk_offset = int(chunk_offset)
-        # Step 3: conditional low-level retry. Requires the master switch, the
-        # retry switch and a positive gap threshold; otherwise plan() below is
-        # unchanged w.r.t. the baseline.
+        # Research switches. ``enabled`` is the master switch: with it off the
+        # planner behaves exactly like the baseline (including subgoal index 1)
+        # no matter what the other research fields say.
+        self._research_on = bool(
+            exec_cfg is not None and getattr(exec_cfg, "enabled", False)
+        )
+        self._diag_on = bool(
+            self._research_on and getattr(exec_cfg, "log_diagnostics", False)
+        )
         retry_threshold = float(
             getattr(exec_cfg, "retry_gap_threshold", 0.0) or 0.0
         )
         self._retry_on = bool(
-            exec_cfg is not None
-            and getattr(exec_cfg, "enabled", False)
+            self._research_on
             and getattr(exec_cfg, "retry_enabled", False)
             and retry_threshold > 0.0
         )
         self.last_retry_info = None
+        self.last_diagnostics = None
+
+    def _subgoal_index(self) -> int:
+        """High-level subgoal index. Fixed to 1 unless the master switch is on."""
+        if self._research_on:
+            return int(getattr(self.exec_cfg, "subgoal_index", 1))
+        return 1
 
     @property
     def task_id_offset(self) -> int:
@@ -67,6 +79,7 @@ class TwoLvlPlanner:
     ):
         batch_size = current_state.shape[0]
         self.last_retry_info = None
+        self.last_diagnostics = None
 
         proprio_l1 = None
         if curr_proprio_pos is not None and curr_proprio_vel is not None:
@@ -103,7 +116,7 @@ class TwoLvlPlanner:
                 device=encs2.device,
             )
         else:
-            subgoal_index = int(getattr(self.exec_cfg, "subgoal_index", 1))
+            subgoal_index = self._subgoal_index()
             self.l1_planner.reset_targets(
                 l2_result.pred_obs[subgoal_index].detach(), repr_input=True
             )
@@ -117,10 +130,36 @@ class TwoLvlPlanner:
             )
             l1_result = self.l1_planner.plan(**l1_plan_kwargs)
 
-            if self._retry_on:
+            gap_metrics = None
+            if self._diag_on or self._retry_on:
+                objective = getattr(self.l1_planner, "objective", None)
+                if objective is not None:
+                    gap_metrics = cross_level_metrics(
+                        l1_result.pred_obs,
+                        l2_result.pred_obs,
+                        objective,
+                        subgoal_index=subgoal_index,
+                    )
+
+            if self._retry_on and gap_metrics is not None:
                 l1_result = self._maybe_retry(
-                    l1_result, l1_plan_kwargs, l2_result, subgoal_index
+                    l1_result,
+                    l1_plan_kwargs,
+                    gap_metrics,
+                    l2_result,
+                    subgoal_index,
                 )
+
+            if self._diag_on and gap_metrics is not None:
+                self.last_diagnostics = dict(gap_metrics)
+                if self.last_retry_info is not None:
+                    self.last_diagnostics[
+                        "gap_selected"
+                    ] = self.last_retry_info.gap_selected
+                    if self.last_retry_info.path_cost_selected is not None:
+                        self.last_diagnostics[
+                            "path_cost_selected"
+                        ] = self.last_retry_info.path_cost_selected
 
         return TwoLvlPlanningResult(level1=l1_result, level2=l2_result)
 
@@ -128,6 +167,7 @@ class TwoLvlPlanner:
         self,
         first_result: PlanningResult,
         plan_kwargs: dict,
+        first_metrics: dict,
         l2_result: PlanningResult,
         subgoal_index: int,
     ) -> PlanningResult:
@@ -136,21 +176,20 @@ class TwoLvlPlanner:
         if objective is None:
             return first_result
 
-        def gap_fn(result: PlanningResult) -> torch.Tensor:
+        def metrics_fn(result: PlanningResult) -> dict:
             return cross_level_metrics(
                 result.pred_obs,
                 l2_result.pred_obs,
                 objective,
                 subgoal_index=subgoal_index,
-            )["cross_mse"]
+            )
 
-        gap_before = gap_fn(first_result)
         merged, info = plan_with_retry(
             plan_kwargs=plan_kwargs,
             planner=self.l1_planner,
             first_result=first_result,
-            gap_before=gap_before,
-            gap_fn=gap_fn,
+            first_metrics=first_metrics,
+            metrics_fn=metrics_fn,
             cfg=self.exec_cfg,
         )
         self.last_retry_info = info

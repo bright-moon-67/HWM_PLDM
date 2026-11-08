@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 import torch
 from pldm.configs import ConfigBase
@@ -53,6 +53,9 @@ class ExecRepairConfig(ConfigBase):
     # Restore CPU/CUDA RNG state when no environment accepts the retry, so a
     # fully rejected retry leaves the episode's randomness untouched.
     retry_restore_rng_on_reject: bool = True
+    # Additionally require the retried plan to be no worse on the path-level
+    # cross-level cost (guards against terminal-only improvements).
+    retry_require_path_cost_improvement: bool = True
 
     # Index into pred_obs used as the high-level subgoal. pred_obs[0] is the
     # current state, so index 1 is one macro step (= step_skip primitives).
@@ -75,7 +78,7 @@ class HierarchicalD4RLMPCConfig(D4RLMPCConfig):
     error_threshold: float = 1.0
     mock_l1: bool = False
     level2: PlannerConfig = PlannerConfig()
-    exec_repair: ExecRepairConfig = ExecRepairConfig()
+    exec_repair: ExecRepairConfig = field(default_factory=ExecRepairConfig)
 
 
 class MPCReport(NamedTuple):

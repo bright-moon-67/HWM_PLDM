@@ -301,6 +301,10 @@ class Evaluator:
             plot_every=plot_every,
         )
 
+        exec_cfg = getattr(mpc_config, "exec_repair", None)
+        if exec_cfg is not None:
+            print(f"[ExecRepair] final config: {exec_cfg}")
+
         if "maze2d" in self.config.env_name:
             from pldm.planning.d4rl.hmpc import HierarchicalD4RLMPCEvaluator
             from pldm.planning.d4rl.enums import HierarchicalD4RLMPCConfig

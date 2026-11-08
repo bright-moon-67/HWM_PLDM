@@ -15,7 +15,10 @@ from pldm.models.utils import flatten_conv_output
 from tqdm import tqdm
 from pldm.logger import Logger
 from pldm.models.utils import flatten_ensemble_conv_output
-from pldm.planning.diagnostics import DiagnosticsRecorder
+from pldm.planning.diagnostics import (
+    DiagnosticsRecorder,
+    execution_prediction_index,
+)
 
 
 class MPCEvaluator(ABC):
@@ -171,14 +174,99 @@ class MPCEvaluator(ABC):
         if exec_cfg is None:
             return None
         output_dir = getattr(exec_cfg, "output_dir", "") or self.output_path
-        if not output_dir:
-            return None
         recorder = DiagnosticsRecorder(
             exec_cfg=exec_cfg,
             output_dir=output_dir,
             chunk_offset=chunk_offset,
         )
-        return recorder if recorder.enabled else None
+        if not recorder.enabled:
+            return None
+        if recorder.path is None:
+            raise RuntimeError(
+                "exec_repair diagnostics are enabled but no output directory is "
+                "available; set eval_cfg.h_d4rl_planning.exec_repair.output_dir "
+                "or make sure the evaluator has an output_path"
+            )
+        return recorder
+
+    def _record_exec_error(
+        self,
+        *,
+        diagnostics,
+        pending,
+        obs_t,
+        curr_proprio_pos,
+        curr_proprio_vel,
+        curr_locations,
+        last_infos,
+        step: int,
+        n_envs: int,
+    ):
+        """Compare the stored low-level prediction with the real observation.
+
+        The primary metric lives in the level-1 encoding space (the same space
+        as the planner's prediction); XY is recorded as a secondary, prober
+        dependent reference.
+        """
+        proprio = None
+        if curr_proprio_pos is not None and curr_proprio_vel is not None:
+            proprio = torch.cat([curr_proprio_pos, curr_proprio_vel], dim=-1).cuda()
+        elif curr_proprio_pos is not None:
+            proprio = curr_proprio_pos.cuda()
+        elif curr_proprio_vel is not None:
+            proprio = curr_proprio_vel.cuda()
+
+        with torch.no_grad():
+            backbone_output = self.model.level1.backbone(
+                obs_t.cuda(),
+                proprio=proprio,
+                locations=(
+                    curr_locations.cuda() if curr_locations is not None else None
+                ),
+            )
+            z_real = backbone_output.obs_component.detach().cpu()
+
+        z_pred = pending["pred_obs"]
+        if z_pred.shape != z_real.shape:
+            raise RuntimeError(
+                "execution diagnostic shape mismatch: predicted "
+                f"{tuple(z_pred.shape)} vs real {tuple(z_real.shape)}"
+            )
+
+        flat_diff = (z_pred - z_real).flatten(start_dim=1)
+        metrics = {
+            "plan_step": pending["plan_step"],
+            "horizon": pending["horizon"],
+            "exec_mse_obs": flat_diff.pow(2).mean(dim=1),
+            "exec_l2_obs": torch.linalg.vector_norm(flat_diff, dim=1),
+        }
+
+        pred_xy = pending.get("pred_xy")
+        if pred_xy is not None and last_infos is not None:
+            real_xy = torch.from_numpy(
+                np.stack(
+                    [
+                        np.asarray(info["location"], dtype=np.float32).reshape(-1)[
+                            :2
+                        ]
+                        for info in last_infos
+                    ]
+                )
+            )
+            if pred_xy.shape == real_xy.shape:
+                diff_xy = pred_xy - real_xy
+                metrics["pred_xy"] = pred_xy
+                metrics["real_xy"] = real_xy
+                metrics["exec_mse_xy"] = diff_xy.pow(2).mean(dim=-1)
+                metrics["exec_l2_xy"] = torch.linalg.vector_norm(diff_xy, dim=-1)
+
+        diagnostics.record(
+            "exec_error",
+            batch_size=n_envs,
+            step=step,
+            level="hier",
+            metrics=metrics,
+        )
 
     def _perform_mpc_in_chunks(self):
         """
@@ -438,6 +526,10 @@ class MPCEvaluator(ABC):
         pred_locations_l2_history = []
         loss_history_l2 = []
 
+        # Step 2 diagnostics: prediction awaiting ``replan_every`` real steps.
+        pending_exec = None
+        last_infos = None
+
         init_infos = [e.get_info() for e in envs]
         if "location" in init_infos[0]:
             location_history.append(np.array([info["location"] for info in init_infos]))
@@ -495,6 +587,20 @@ class MPCEvaluator(ABC):
                 else:
                     curr_locations = None
 
+                if pending_exec is not None and diagnostics is not None:
+                    self._record_exec_error(
+                        diagnostics=diagnostics,
+                        pending=pending_exec,
+                        obs_t=obs_t,
+                        curr_proprio_pos=curr_proprio_pos,
+                        curr_proprio_vel=curr_proprio_vel,
+                        curr_locations=curr_locations,
+                        last_infos=last_infos,
+                        step=i,
+                        n_envs=len(envs),
+                    )
+                    pending_exec = None
+
                 if bilevel_planning:
                     plan_size = (max_plan_horizon_l2 - i + step_skip - 1) // step_skip
                     plan_size = max(plan_size, self.config.level2.min_plan_length)
@@ -528,6 +634,45 @@ class MPCEvaluator(ABC):
                                 metrics=retry_info.as_dict(),
                             )
                             planner.last_retry_info = None
+
+                    # Step 1: cross-level gap of the first L1 plan.
+                    if diagnostics is not None:
+                        gap_metrics = getattr(planner, "last_diagnostics", None)
+                        if gap_metrics is not None:
+                            diagnostics.record(
+                                "plan_gap",
+                                batch_size=len(envs),
+                                step=i,
+                                level="hier",
+                                metrics=gap_metrics,
+                            )
+                            planner.last_diagnostics = None
+
+                    # Step 2: store the prediction that matches replan_every
+                    # executed steps; it is compared at the next replan.
+                    if diagnostics is not None:
+                        pred_obs = getattr(planning_result, "pred_obs", None)
+                        if pred_obs is not None:
+                            pred_index = execution_prediction_index(
+                                self.config.replan_every, pred_obs.shape[0]
+                            )
+                            if pred_index is not None:
+                                pred_xy = None
+                                locations = getattr(
+                                    planning_result, "locations", None
+                                )
+                                if (
+                                    locations is not None
+                                    and locations.shape[0] > pred_index
+                                ):
+                                    loc = locations[pred_index].detach().cpu()
+                                    pred_xy = loc.reshape(loc.shape[0], -1)[:, :2]
+                                pending_exec = {
+                                    "pred_obs": pred_obs[pred_index].detach().cpu(),
+                                    "pred_xy": pred_xy,
+                                    "plan_step": i,
+                                    "horizon": pred_index,
+                                }
 
             if bilevel_planning:
                 pred = self._get_relevant_pred(
@@ -588,6 +733,7 @@ class MPCEvaluator(ABC):
             current_obs = torch.from_numpy(np.stack([r[0] for r in results])).float()
             rewards_t = torch.from_numpy(np.stack([r[1] for r in results])).float()
             infos = [r[4] for r in results]
+            last_infos = infos
 
             action_history.append(planned_actions.detach().cpu())
             observation_history.append(current_obs)
