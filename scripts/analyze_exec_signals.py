@@ -161,6 +161,69 @@ def roc_auc(scores: List[float], labels: List[int]) -> Optional[float]:
     return float((rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
+def _quantiles(values: List[float], qs: Tuple[float, ...]) -> List[float]:
+    if not values:
+        return []
+    ordered = sorted(values)
+    out = []
+    for q in qs:
+        index = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+        out.append(ordered[index])
+    return out
+
+
+def sweep_thresholds(
+    buckets: Dict[str, Dict[int, List[float]]],
+    labels: Dict[int, int],
+    metric: str,
+    direction: str,
+    thresholds: List[float],
+) -> List[Dict[str, Any]]:
+    """Simulate how many decisions a given trigger threshold would fire.
+
+    ``direction == "high"`` triggers when ``value > threshold`` (cross_mse);
+    ``direction == "low"`` triggers when ``value < threshold`` (pred_progress).
+
+    This needs no second plan: it only answers "how often would we have
+    retried, and do the retried decisions concentrate on tasks that eventually
+    failed?".
+    """
+    task_values: Dict[int, List[float]] = buckets[metric]
+    rows: List[Dict[str, Any]] = []
+    for threshold in thresholds:
+        triggered_tasks, clean_tasks = [], []
+        n_decisions = 0
+        n_triggered = 0
+        for task_id, samples in task_values.items():
+            if task_id not in labels or not samples:
+                continue
+            n_decisions += len(samples)
+            hits = (
+                sum(1 for v in samples if v > threshold)
+                if direction == "high"
+                else sum(1 for v in samples if v < threshold)
+            )
+            n_triggered += hits
+            (triggered_tasks if hits else clean_tasks).append(labels[task_id])
+        rows.append(
+            {
+                "metric": metric,
+                "direction": direction,
+                "threshold": threshold,
+                "decisions": n_decisions,
+                "triggered": n_triggered,
+                "trigger_rate": (
+                    n_triggered / n_decisions if n_decisions else float("nan")
+                ),
+                "success_tasks_triggered": triggered_tasks.count(1),
+                "failure_tasks_triggered": triggered_tasks.count(0),
+                "success_tasks_clean": clean_tasks.count(1),
+                "failure_tasks_clean": clean_tasks.count(0),
+            }
+        )
+    return rows
+
+
 def _mean_std(values: List[float]) -> str:
     if not values:
         return "n/a"
@@ -235,6 +298,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="also report metrics computed only from steps < N (0 disables)",
     )
     parser.add_argument("--out", default=None, help="optional output json path")
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="also sweep trigger thresholds and report trigger rates",
+    )
     args = parser.parse_args(argv)
 
     paths = _resolve_paths(args.path)
@@ -265,6 +333,46 @@ def main(argv: Optional[List[str]] = None) -> int:
         "\nAUC(fail) > 0.5 => larger metric values go with failures. "
         "A metric with AUC ~ 0.5 carries no failure information."
     )
+
+    if args.sweep:
+        flat = {n: b["all"] for n, b in buckets.items()}
+        sweep_rows: List[Dict[str, Any]] = []
+        print("\n== trigger threshold sweep (all steps) ==")
+        print(
+            f"{'metric':<20}{'rule':<12}{'thr':>9}{'rate':>8}"
+            f"{'trig_succ':>11}{'trig_fail':>11}{'clean_succ':>12}{'clean_fail':>12}"
+        )
+        for metric, direction in (
+            ("cross_mse", "high"),
+            ("pred_progress_h", "low"),
+            ("pred_progress_4", "low"),
+        ):
+            samples = [v for task_vals in flat[metric].values() for v in task_vals]
+            if not samples:
+                continue
+            thresholds = _quantiles(
+                samples, (0.1, 0.25, 0.5, 0.75, 0.9)
+            )
+            if direction == "high":
+                thresholds = [0.02, 0.04, 0.06, 0.08, 0.10]
+            else:
+                thresholds = [0.3, 0.5, 0.7, 0.85, 0.95]
+            rows_m = sweep_thresholds(flat, labels, metric, direction, thresholds)
+            sweep_rows.extend(rows_m)
+            for row in rows_m:
+                print(
+                    f"{metric:<20}{direction:<12}{row['threshold']:>9.3f}"
+                    f"{row['trigger_rate']:>8.3f}"
+                    f"{row['success_tasks_triggered']:>11}"
+                    f"{row['failure_tasks_triggered']:>11}"
+                    f"{row['success_tasks_clean']:>12}"
+                    f"{row['failure_tasks_clean']:>12}"
+                )
+        rows.extend(sweep_rows)
+        print(
+            "\ntrig_* = tasks with at least one triggered decision; "
+            "clean_* = tasks never triggered."
+        )
 
     if args.out:
         out_path = Path(args.out)
