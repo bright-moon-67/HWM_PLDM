@@ -43,6 +43,7 @@ from pldm.planning.diagnostics import project_l1_encoding_to_l2
 from pldm.planning.level_retry import (
     blend_planning_results,
     restore_low_level_state,
+    restore_rng_state,
     snapshot_low_level_state,
 )
 from pldm.planning.planners.planner import PlanningResult
@@ -95,6 +96,16 @@ class RepairInfo:
     # Distance between this repair target and the previous one (review 4, 4.3):
     # large values on consecutive repairs mean the subgoal is oscillating.
     subgoal_shift: Optional[torch.Tensor] = None
+    # ECCHP stage 0: which acceptance rule was applied, and whether the
+    # selected candidate would also have passed the legacy "the gap must
+    # improve" rule. Keeping both lets an analysis separate candidates that
+    # are only good under the combined score (e.g. a necessary detour).
+    acceptance_rule: str = "legacy_gap"
+    gap_improved: Optional[torch.Tensor] = None
+    # ECCHP stage 2: per-candidate evidence (model scores + the L1 action chunk
+    # that would have been executed). Kept in-process only - it contains action
+    # tensors, so it is deliberately excluded from :meth:`as_dict`.
+    candidate_evidence: Optional[List[Dict[str, Any]]] = None
 
     @property
     def n_triggered(self) -> int:
@@ -128,10 +139,12 @@ class RepairInfo:
             "candidate_gap_spread",
             "candidate_jh_spread",
             "subgoal_shift",
+            "gap_improved",
         ):
             value = getattr(self, name)
             if value is not None:
                 payload[name] = value
+        payload["acceptance_rule"] = self.acceptance_rule
         return payload
 
 
@@ -359,6 +372,7 @@ def plan_with_high_level_reselection(
     subgoal_index: int = 1,
     lambda_vector: Optional[torch.Tensor] = None,
     trigger_mask: Optional[torch.Tensor] = None,
+    min_improvement: Any = None,
 ) -> Tuple[PlanningResult, PlanningResult, Optional[RepairInfo]]:
     """Re-search the L2 plan and keep the most low-level-reachable candidate.
 
@@ -373,8 +387,14 @@ def plan_with_high_level_reselection(
     2. among feasible candidates, minimise the normalised combination
        ``J_H_norm + lambda * C_L_norm``.
 
-    Requiring feasibility instead of "the gap must improve" avoids rejecting a
-    globally better detour just because its terminal gap is not smaller.
+    Acceptance (two rules, selected by ``repair_require_gap_improvement``):
+
+    * legacy (default): the candidate must also lower the terminal cross-level
+      gap by ``min_improvement`` -- historically the only rule; it silently
+      vetoes long-term-better detours;
+    * ``repair_require_gap_improvement=false``: accept whenever the combined
+      score improves. This is the rule ECCHP needs, and the per-decision
+      ``gap_improved`` field keeps the two comparable in the logs.
 
     ``lambda_vector`` (``(B,)``) is the per-environment weight. When ``None``
     the constant ``cfg.high_level_cost_weight`` is used.
@@ -397,7 +417,13 @@ def plan_with_high_level_reselection(
         return l1_first_result, l2_first_result, None
 
     batch_size = gap_before.numel()
-    min_improvement = float(getattr(cfg, "repair_min_improvement", 0.0))
+    min_improvement = (
+        _as_tensor(min_improvement, gap_before)
+        if min_improvement is not None
+        else torch.full_like(
+            gap_before, float(getattr(cfg, "repair_min_improvement", 0.0))
+        )
+    )
     gap_tolerance = float(getattr(cfg, "repair_gap_tolerance", 0.0))
     base_weight = float(getattr(cfg, "high_level_cost_weight", 0.5))
     if lambda_vector is None:
@@ -513,15 +539,42 @@ def plan_with_high_level_reselection(
     score_before = scores[0]
 
     reachable_ok = selected_gap <= (gap_before + gap_tolerance)
+    gap_improved = ((gap_before - selected_gap) > min_improvement) & reachable_ok
+    # ECCHP stage 0: the legacy rule required the *terminal cross-level gap* to
+    # improve. That silently vetoes detours that are long-term better (the
+    # whole point of execution-calibrated switching), so it can be turned off
+    # (``repair_require_gap_improvement=false``). When off, acceptance relies on
+    # the feasibility gate plus the combined score ``J_H + lambda * C_L`` only.
+    require_gap_improvement = bool(
+        getattr(cfg, "repair_require_gap_improvement", True)
+    )
+    legacy_ok = (
+        gap_improved if require_gap_improvement else torch.ones_like(gap_improved)
+    )
     accepted = (
         triggered
         & finite
-        & reachable_ok
-        & ((gap_before - selected_gap) > min_improvement)
+        & legacy_ok
         & (selected_score < score_before)
     )
     accepted = accepted.to(dtype=torch.bool)
     selected = torch.where(accepted, selected, torch.zeros_like(selected))
+
+    if bool(getattr(cfg, "repair_force_reject", False)):
+        # Validation / shadow mode: build and rank the candidates, then drop
+        # them. With the RNG restoration below, such a run must be identical to
+        # the baseline (stage-0 isolation test).
+        accepted = torch.zeros_like(accepted)
+        selected = torch.zeros_like(selected)
+
+    # RNG isolation: a triggered-but-fully-rejected repair must not advance the
+    # episode's random stream. Candidate re-sampling draws fresh MPPI noise; if
+    # that noise leaked into later plans, merely *considering* a repair would
+    # change the trajectory, which makes every ablation unreadable.
+    if bool(getattr(cfg, "repair_restore_rng_on_reject", True)) and not bool(
+        accepted.any()
+    ):
+        restore_rng_state(snapshots[0]["l1"])
 
     merged_l1 = candidate_l1[0]
     merged_l2 = candidate_l2[0]
@@ -540,6 +593,38 @@ def plan_with_high_level_reselection(
             continue
         restore_low_level_state(h_planner.l1_planner, snapshot["l1"], env_mask=mask)
         restore_low_level_state(h_planner.l2_planner, snapshot["l2"], env_mask=mask)
+
+    # ECCHP stage 2: expose the candidate set so a collection run can replay it
+    # from the same real state. ``PlanningResult.actions`` is the *executed*
+    # action space (already un-normalised by ``MPPIPlanner.plan``), unlike the
+    # MPPI warm start ``ctrl.U``, so it can be replayed in the environment
+    # without a second conversion.
+    candidate_evidence: Optional[List[Dict[str, Any]]] = None
+    if bool(getattr(cfg, "collect_candidates", False)):
+        candidate_evidence = []
+        for index, candidate_l1_result in enumerate(candidate_l1):
+            actions = getattr(candidate_l1_result, "actions", None)
+            candidate_evidence.append(
+                {
+                    "candidate_id": int(index),
+                    "source": "hwm" if index == 0 else "resample",
+                    "high_level_cost": (
+                        candidate_jh[index].detach().cpu()
+                        if candidate_jh[index] is not None
+                        else None
+                    ),
+                    "cross_mse": gaps[index].detach().cpu(),
+                    "pred_progress_h": (
+                        candidate_progress[index].detach().cpu()
+                        if candidate_progress[index] is not None
+                        else None
+                    ),
+                    "selected": (selected == index).detach().cpu(),
+                    "actions": (
+                        actions.detach().cpu() if torch.is_tensor(actions) else None
+                    ),
+                }
+            )
 
     return merged_l1, merged_l2, RepairInfo(
         triggered=triggered,
@@ -577,6 +662,11 @@ def plan_with_high_level_reselection(
             else torch.stack(candidate_jh[1:], dim=0).max(dim=0).values
             - torch.stack(candidate_jh[1:], dim=0).min(dim=0).values
         ),
+        acceptance_rule=(
+            "legacy_gap" if require_gap_improvement else "combined_score"
+        ),
+        gap_improved=gap_improved,
+        candidate_evidence=candidate_evidence,
     )
 
 

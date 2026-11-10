@@ -17,10 +17,23 @@ from pldm.logger import Logger
 from pldm.models.utils import flatten_ensemble_conv_output
 from pldm.planning.diagnostics import (
     DiagnosticsRecorder,
+    ExecutionOutcomeRecord,
+    PlanTransitionRecord,
     execution_prediction_index,
     project_l1_encoding_to_l2,
 )
 from pldm.planning.exec_feedback import ExecutionFeedback
+from pldm.planning.env_snapshot import (
+    restore_env,
+    snapshot_env,
+    supports_snapshot,
+)
+from pldm.planning.level_retry import (
+    restore_low_level_state,
+    snapshot_low_level_state,
+)
+from pldm.planning.maze_metrics import graph_distance
+from pldm.planning.progress_estimator import RouteHistory
 from pldm.planning.warm_start import shift_low_level_warm_start
 
 
@@ -116,6 +129,49 @@ class MPCEvaluator(ABC):
     # ------------------------------------------------------------ research cfg
     def _exec_cfg(self):
         return getattr(self.config, "exec_repair", None)
+
+    def _plan_events_on(self) -> bool:
+        """Whether ECCHP stage-1 plan events are recorded for this run."""
+        cfg = self._exec_cfg()
+        return bool(
+            cfg is not None
+            and getattr(cfg, "enabled", False)
+            and (
+                getattr(cfg, "log_plan_events", False)
+                or getattr(cfg, "collect_candidates", False)
+            )
+        )
+
+    def _candidate_collection_config(self) -> Optional[dict]:
+        """Horizons / budget for stage-2 counterfactual replay, or ``None``."""
+        cfg = self._exec_cfg()
+        if (
+            cfg is None
+            or not getattr(cfg, "enabled", False)
+            or not getattr(cfg, "collect_candidates", False)
+        ):
+            return None
+        horizons = []
+        for part in str(
+            getattr(cfg, "candidate_horizons", "40,80") or ""
+        ).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(float(part))
+            except ValueError:
+                continue
+            if value > 0:
+                horizons.append(value)
+        if not horizons:
+            return None
+        return {
+            "horizons": sorted(set(horizons)),
+            "max_decisions": int(
+                getattr(cfg, "candidate_max_decisions", 0) or 0
+            ),
+        }
 
     def _should_shift_l1_warm_start(self) -> bool:
         """Whether to refresh the low-level MPPI warm start before replanning."""
@@ -361,6 +417,430 @@ class MPCEvaluator(ABC):
                 metrics=metrics,
             )
         return metrics
+
+    # ------------------------------------------------- ECCHP stage-1 events
+    def _record_plan_events(
+        self,
+        *,
+        diagnostics,
+        decision,
+        start_xy,
+        step: int,
+        n_envs: int,
+    ) -> None:
+        """Write one ``plan_decision`` and one ``plan_transition`` per env.
+
+        The two events share ``decision_id``/``plan_id`` so a reader can join
+        them with the later ``execution_outcome`` lines without parsing the
+        whole file into one giant table.
+        """
+        records = (decision or {}).get("records") or []
+        for record in records:
+            index = int(getattr(record, "env_index", 0))
+            if start_xy is not None and record.start_xy is None:
+                if index < start_xy.shape[0]:
+                    record.start_xy = (
+                        start_xy[index].detach().cpu().reshape(-1)[:2].tolist()
+                    )
+            diagnostics.record_plan_decision(record, step=step)
+            diagnostics.record_plan_transition(
+                PlanTransitionRecord(
+                    task_id=record.task_id,
+                    env_index=index,
+                    step=step,
+                    decision_id=record.decision_id,
+                    plan_id_before=record.previous_plan_id,
+                    plan_id_after=record.plan_id,
+                    switched=record.switched,
+                    reason=record.switch_reason,
+                    plan_age_replans=record.plan_age_replans,
+                ),
+                step=step,
+            )
+
+    def _record_plan_outcome(
+        self,
+        *,
+        diagnostics,
+        pending,
+        exec_metrics,
+        route_metrics,
+        start_xy,
+        step: int,
+        n_envs: int,
+    ) -> None:
+        """Write one ``execution_outcome`` line per environment."""
+        decision = pending.get("plan_decision") if pending else None
+        records = (decision or {}).get("records") or []
+        if not records:
+            return
+
+        def _at(value, index):
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                flat = value.detach().cpu().reshape(-1)
+                if flat.numel() <= index:
+                    return None
+                return float(flat[index].double().item())
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _point(value, index):
+            if value is None or not torch.is_tensor(value):
+                return None
+            if value.shape[0] <= index:
+                return None
+            return value[index].detach().cpu().reshape(-1)[:2].tolist()
+
+        for record in records:
+            index = int(getattr(record, "env_index", 0))
+            if index >= n_envs:
+                continue
+            stuck = _at((exec_metrics or {}).get("stuck_window"), index)
+            diagnostics.record_execution_outcome(
+                ExecutionOutcomeRecord(
+                    task_id=record.task_id,
+                    env_index=index,
+                    step=step,
+                    decision_id=record.decision_id,
+                    plan_id=record.plan_id,
+                    start_xy=_point(pending.get("start_xy"), index),
+                    end_xy=_point(start_xy, index),
+                    predicted_xy=_point(pending.get("pred_xy"), index),
+                    displacement=_at((exec_metrics or {}).get("real_move"), index),
+                    predicted_displacement=_at(
+                        (exec_metrics or {}).get("pred_move"), index
+                    ),
+                    subgoal_dist_before=_at(pending.get("initial_dist"), index),
+                    subgoal_dist_after=_at(
+                        (exec_metrics or {}).get("real_dist_h"), index
+                    ),
+                    real_progress_h=_at(
+                        (exec_metrics or {}).get("real_progress_h"), index
+                    ),
+                    pred_progress_h=_at(
+                        (exec_metrics or {}).get("pred_progress_h"), index
+                    ),
+                    execution_progress_gap=_at(
+                        (exec_metrics or {}).get("execution_progress_gap"), index
+                    ),
+                    exec_mse_obs=_at(
+                        (exec_metrics or {}).get("exec_mse_obs"), index
+                    ),
+                    exec_mse_xy=_at((exec_metrics or {}).get("exec_mse_xy"), index),
+                    route_path_length=_at(
+                        (route_metrics or {}).get("route_path_length"), index
+                    ),
+                    route_efficiency=_at(
+                        (route_metrics or {}).get("route_efficiency"), index
+                    ),
+                    route_revisit_count=_at(
+                        (route_metrics or {}).get("route_revisit_count"), index
+                    ),
+                    stuck=None if stuck is None else bool(stuck > 0.5),
+                ),
+                step=step,
+            )
+
+    # ------------------------------------- ECCHP stage-2 counterfactual replay
+    @staticmethod
+    def _env_xy(env):
+        """Real XY of ``env`` (``info['location']``), or ``None``."""
+        try:
+            info = env.get_info()
+            if "location" in info:
+                return np.asarray(info["location"], dtype=np.float64).reshape(-1)[:2]
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            return np.asarray(
+                env.get_pos(normalized=False), dtype=np.float64
+            ).reshape(-1)[:2]
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def _stacked_obs_single(self, env) -> torch.Tensor:
+        """Observation tensor for a single environment, stacked as in MPC."""
+        obs = torch.from_numpy(np.stack([env.get_obs()])).float()
+        if self.image_based:
+            obs = torch.cat([obs] * self.config.stack_states, dim=1)
+        return obs
+
+    def _rollout_candidate_actions(
+        self,
+        env,
+        planner,
+        first_actions: torch.Tensor,
+        horizon: int,
+        *,
+        max_plan_horizon_l2: int,
+        step_skip: int,
+    ) -> int:
+        """Execute a candidate chunk, then continue with the normal controller.
+
+        The first ``first_actions`` come from the candidate L1 plan. After that,
+        **the same HWM controller** is used for every candidate, which is what
+        makes the comparison a counterfactual on the *high-level plan* rather
+        than on the low-level controller.
+
+        ``first_actions`` are ``PlanningResult.actions`` (already un-normalised
+        to the environment action space). They are deliberately *not* taken from
+        ``ctrl.U``, which lives in the MPPI search space and would silently
+        corrupt the replay.
+        """
+        executed = 0
+        n_first = int(min(int(first_actions.shape[0]), int(horizon)))
+        for t in range(n_first):
+            action = first_actions[t].detach().cpu().numpy().astype(np.float32)
+            env.step(action)
+            executed += 1
+
+        replan_every = int(self.config.replan_every)
+        while executed < horizon:
+            obs = self._stacked_obs_single(env)
+            proprio_pos = None
+            if self.model.level1.using_proprio_pos:
+                proprio_pos = torch.from_numpy(
+                    np.stack([env.get_proprio_pos(normalized=True)])
+                ).float()
+            proprio_vel = None
+            if self.model.level1.using_proprio_vel:
+                proprio_vel = torch.from_numpy(
+                    np.stack([env.get_proprio_vel(normalized=True)])
+                ).float()
+            locations = None
+            if self.model.level1.using_location:
+                locations = torch.from_numpy(
+                    np.stack([env.get_pos(normalized=True)])
+                ).float()
+
+            plan_size = (
+                max_plan_horizon_l2 - executed + step_skip - 1
+            ) // step_skip
+            plan_size = max(plan_size, self.config.level2.min_plan_length)
+            result = planner.plan(
+                obs,
+                plan_size=plan_size,
+                repr_input=False,
+                curr_proprio_pos=proprio_pos,
+                curr_proprio_vel=proprio_vel,
+                curr_locations=locations,
+                decision_step=executed,
+            )
+            actions = result.level1.actions if hasattr(result, "level1") else result.actions
+            n_exec = min(replan_every, horizon - executed)
+            if actions.shape[1] < n_exec:
+                n_exec = int(actions.shape[1])
+            if n_exec <= 0:  # pragma: no cover - defensive
+                break
+            for t in range(n_exec):
+                action = actions[0, t].detach().cpu().numpy().astype(np.float32)
+                env.step(action)
+                executed += 1
+        return executed
+
+    def _collect_counterfactual_returns(
+        self,
+        *,
+        envs,
+        planner,
+        evidence,
+        decision,
+        step: int,
+        diagnostics,
+        collection_cfg,
+        decisions_collected: int,
+        repair_info=None,
+    ) -> int:
+        """Replay every candidate from the same real state and log returns.
+
+        All simulator state, planner warm starts and RNG state are restored
+        afterwards, so the collected data cannot change the factual trajectory
+        of the run (see the stage-0 isolation tests).
+        """
+        if collection_cfg is None or not evidence:
+            return 0
+        max_decisions = int(collection_cfg.get("max_decisions", 0) or 0)
+        if max_decisions and decisions_collected >= max_decisions:
+            return 0
+
+        unavailable = [i for i, env in enumerate(envs) if not supports_snapshot(env)]
+        if unavailable:
+            if diagnostics is not None:
+                diagnostics.record(
+                    "candidate_replay_unavailable",
+                    batch_size=len(envs),
+                    step=step,
+                    level="hier",
+                    metrics={
+                        "unsupported_env_indices": unavailable,
+                        "reason": "environment does not expose full state snapshots",
+                    },
+                )
+            return 0
+
+        records = (decision or {}).get("records") or []
+        snapshots = [snapshot_env(env) for env in envs]
+        planner_snapshot = {
+            "l1": snapshot_low_level_state(planner.l1_planner),
+            "l2": snapshot_low_level_state(planner.l2_planner),
+        }
+        rng_devices = (
+            [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        )
+        step_skip = int(self.model.config.step_skip)
+        max_plan_horizon_l2 = int(self.config.level2.max_plan_length) * step_skip
+
+        try:
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                triggered = getattr(repair_info, "triggered", None)
+                if torch.is_tensor(triggered):
+                    triggered = triggered.detach().cpu().reshape(-1)
+                for env_index, env in enumerate(envs):
+                    if triggered is not None and (
+                        env_index >= triggered.numel()
+                        or not bool(triggered[env_index])
+                    ):
+                        # Only environments whose repair branch fired have a
+                        # comparable candidate set; the others only contain
+                        # their own plan.
+                        continue
+                    record = (
+                        records[env_index] if env_index < len(records) else None
+                    )
+                    start_xy = self._env_xy(env)
+                    d_start = graph_distance(env, start_xy)
+                    for candidate in evidence:
+                        actions = candidate.get("actions")
+                        if actions is None:
+                            continue
+                        per_env = (
+                            actions[env_index]
+                            if actions.dim() == 3
+                            else actions
+                        )
+                        for horizon in collection_cfg["horizons"]:
+                            restore_env(env, snapshots[env_index])
+                            executed = self._rollout_candidate_actions(
+                                env,
+                                planner,
+                                per_env,
+                                int(horizon),
+                                max_plan_horizon_l2=max_plan_horizon_l2,
+                                step_skip=step_skip,
+                            )
+                            end_xy = self._env_xy(env)
+                            d_end = graph_distance(env, end_xy)
+                            real_return = (
+                                float(d_start - d_end)
+                                if d_start is not None and d_end is not None
+                                else None
+                            )
+                            if diagnostics is not None:
+                                diagnostics.record(
+                                    "candidate_outcome",
+                                    task_ids=[
+                                        int(record.task_id)
+                                        if record is not None
+                                        else int(env_index)
+                                    ],
+                                    step=step,
+                                    level="hier",
+                                    metrics={
+                                        "env_index": int(env_index),
+                                        "task_id": (
+                                            int(record.task_id)
+                                            if record is not None
+                                            else int(env_index)
+                                        ),
+                                        "decision_id": (
+                                            int(record.decision_id)
+                                            if record is not None
+                                            else -1
+                                        ),
+                                        "plan_id": (
+                                            int(record.plan_id)
+                                            if record is not None
+                                            else -1
+                                        ),
+                                        "candidate_id": int(
+                                            candidate.get("candidate_id", -1)
+                                        ),
+                                        "candidate_source": str(
+                                            candidate.get("source", "unknown")
+                                        ),
+                                        "selected": bool(
+                                            torch.is_tensor(candidate.get("selected"))
+                                            and bool(
+                                                candidate["selected"][env_index].item()
+                                            )
+                                        ),
+                                        "model_score": self._candidate_scalar(
+                                            candidate.get("high_level_cost"),
+                                            env_index,
+                                        ),
+                                        "cross_mse": self._candidate_scalar(
+                                            candidate.get("cross_mse"), env_index
+                                        ),
+                                        "predicted_progress": self._candidate_scalar(
+                                            candidate.get("pred_progress_h"),
+                                            env_index,
+                                        ),
+                                        "horizon": int(horizon),
+                                        "executed_steps": int(executed),
+                                        "start_xy": None
+                                        if start_xy is None
+                                        else start_xy.tolist(),
+                                        "end_xy": None
+                                        if end_xy is None
+                                        else end_xy.tolist(),
+                                        "graph_distance_before": d_start,
+                                        "graph_distance_after": d_end,
+                                        "real_return": real_return,
+                                        "replay_mode": "candidate_chunk+follow_up_hwm",
+                                    },
+                                )
+        except Exception as exc:
+            # Collection must never take down an evaluation run.
+            if diagnostics is not None:
+                diagnostics.record(
+                    "candidate_replay_error",
+                    batch_size=len(envs),
+                    step=step,
+                    level="hier",
+                    metrics={"error": repr(exc)},
+                )
+            return 0
+        finally:
+            for env, snapshot in zip(envs, snapshots):
+                try:
+                    restore_env(env, snapshot)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            restore_low_level_state(planner.l1_planner, planner_snapshot["l1"])
+            restore_low_level_state(planner.l2_planner, planner_snapshot["l2"])
+        return 1
+
+    @staticmethod
+    def _candidate_scalar(value, index: int):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            flat = value.detach().cpu().reshape(-1)
+            if flat.numel() == 0:
+                return None
+            if flat.numel() == 1:
+                return float(flat[0].double().item())
+            if index < flat.numel():
+                return float(flat[index].double().item())
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _perform_mpc_in_chunks(self):
         """
@@ -629,6 +1109,25 @@ class MPCEvaluator(ABC):
         last_infos = None
         # Step 6: online execution feedback owned by the hierarchical planner.
         exec_feedback = getattr(planner, "exec_feedback", None)
+        # ECCHP stage 1: real-XY route indicators and plan-event recording.
+        plan_events_on = bool(bilevel_planning and self._plan_events_on())
+        exec_cfg = self._exec_cfg()
+        route_history = (
+            RouteHistory(
+                len(envs),
+                window=int(getattr(exec_cfg, "route_history_window", 8) or 8),
+                revisit_radius=float(
+                    getattr(exec_cfg, "revisit_radius", 0.25) or 0.25
+                ),
+            )
+            if plan_events_on
+            else None
+        )
+        # ECCHP stage 2: counterfactual candidate replay (opt-in, expensive).
+        collection_cfg = (
+            self._candidate_collection_config() if bilevel_planning else None
+        )
+        candidates_collected = 0
 
         init_infos = [e.get_info() for e in envs]
         if "location" in init_infos[0]:
@@ -661,6 +1160,19 @@ class MPCEvaluator(ABC):
 
         for i in tqdm(range(max_steps), desc="Planning steps"):
             if i % self.config.replan_every == 0:
+                # ECCHP stage 1: refresh the route indicators with the real
+                # position *before* the new decision, so the window recorded
+                # below covers exactly the steps that were executed since the
+                # previous decision.
+                route_metrics = None
+                current_xy = None
+                plan_decision = None
+                if route_history is not None:
+                    current_xy = _start_xy_from_infos(
+                        last_infos if last_infos is not None else init_infos
+                    )
+                    route_metrics = route_history.update(current_xy)
+
                 if self.model.level1.using_proprio_pos:
                     curr_proprio_pos = [
                         e.get_proprio_pos(normalized=True) for e in envs
@@ -729,6 +1241,18 @@ class MPCEvaluator(ABC):
                         stuck = exec_metrics.get("stuck_window")
                         if stuck is not None:
                             exec_feedback.update_stuck(stuck > 0.5)
+                    # ECCHP stage 1: attribute the window to the plan that
+                    # produced it.
+                    if diagnostics is not None and plan_events_on:
+                        self._record_plan_outcome(
+                            diagnostics=diagnostics,
+                            pending=pending_exec,
+                            exec_metrics=exec_metrics,
+                            route_metrics=route_metrics,
+                            start_xy=current_xy,
+                            step=i,
+                            n_envs=len(envs),
+                        )
                     pending_exec = None
 
                 if bilevel_planning:
@@ -754,18 +1278,26 @@ class MPCEvaluator(ABC):
                         int(self.config.replan_every),
                     )
 
-                planning_result = planner.plan(
-                    obs_t,
+                plan_kwargs = dict(
                     curr_proprio_pos=curr_proprio_pos,
                     curr_proprio_vel=curr_proprio_vel,
                     curr_locations=curr_locations,
                     plan_size=plan_size,
                     repr_input=False,
                 )
+                if isinstance(planner, TwoLvlPlanner):
+                    # ECCHP stage 1: the planner does not know the global step,
+                    # but plan-level records need it for the replay index.
+                    plan_kwargs["decision_step"] = i
+                planning_result = planner.plan(obs_t, **plan_kwargs)
 
                 if bilevel_planning:
                     planning_result_l2 = planning_result.level2
                     planning_result = planning_result.level1
+                    # ECCHP stage 1: the decision record produced by
+                    # ``TwoLvlPlanner`` (None unless ``log_plan_events`` is on).
+                    plan_decision = getattr(planner, "last_plan_decision", None)
+                    repair_info_obj = getattr(planner, "last_repair_info", None)
 
                     # Step 3: log the retry decision (no-op unless enabled).
                     if diagnostics is not None:
@@ -792,6 +1324,18 @@ class MPCEvaluator(ABC):
                                 metrics=repair_info.as_dict(),
                             )
                             planner.last_repair_info = None
+                        # ECCHP stage 0: a failed candidate search is recorded
+                        # instead of disappearing into the fallback path.
+                        repair_error = getattr(planner, "last_repair_error", None)
+                        if repair_error:
+                            diagnostics.record(
+                                "repair_error",
+                                batch_size=len(envs),
+                                step=i,
+                                level="hier",
+                                metrics={"error": str(repair_error)},
+                            )
+                            planner.last_repair_error = None
 
                     # Step 1: cross-level gap of the first L1 plan.
                     if diagnostics is not None:
@@ -805,6 +1349,39 @@ class MPCEvaluator(ABC):
                                 metrics=gap_metrics,
                             )
                             planner.last_diagnostics = None
+
+                    # ECCHP stage 1: plan-level decision and transition events.
+                    if diagnostics is not None and plan_decision is not None:
+                        self._record_plan_events(
+                            diagnostics=diagnostics,
+                            decision=plan_decision,
+                            start_xy=current_xy,
+                            step=i,
+                            n_envs=len(envs),
+                        )
+                        planner.last_plan_decision = None
+
+                    # ECCHP stage 2: replay every candidate from the same real
+                    # state and log its realised return. All simulator and
+                    # planner state is restored afterwards, so enabling this
+                    # cannot change the executed trajectory.
+                    if collection_cfg is not None:
+                        evidence = getattr(planner, "last_candidate_evidence", None)
+                        if evidence:
+                            planner.last_candidate_evidence = None
+                            candidates_collected += (
+                                self._collect_counterfactual_returns(
+                                    envs=envs,
+                                    planner=planner,
+                                    evidence=evidence,
+                                    decision=plan_decision,
+                                    step=i,
+                                    diagnostics=diagnostics,
+                                    collection_cfg=collection_cfg,
+                                    decisions_collected=candidates_collected,
+                                    repair_info=repair_info_obj,
+                                )
+                            )
 
                     # Step 2: store the prediction that matches replan_every
                     # executed steps; it is compared at the next replan.
@@ -856,6 +1433,9 @@ class MPCEvaluator(ABC):
                                     "pred_progress_h": _cpu(
                                         exec_context.get("pred_progress_h")
                                     ),
+                                    # ECCHP stage 1: keep the plan identity so
+                                    # the next window can be attributed to it.
+                                    "plan_decision": plan_decision,
                                 }
 
             if bilevel_planning:

@@ -4,6 +4,17 @@ import torch
 
 from pldm.planning.diagnostics import cross_level_metrics, loggable_gap_metrics
 from pldm.planning.level_retry import plan_with_retry
+from pldm.planning.plan_memory import (
+    REASON_KEEP,
+    REASON_REPAIR_PROJECTION,
+    REASON_REPAIR_RESElection,
+    REASON_RETRY,
+    SOURCE_HWM,
+    SOURCE_REPAIR_PROJECTION,
+    SOURCE_REPAIR_RESElection,
+    SOURCE_RETRY,
+    PlanMemory,
+)
 from pldm.planning.subgoal_repair import (
     plan_with_high_level_reselection,
     plan_with_reachable_projection,
@@ -102,6 +113,22 @@ class TwoLvlPlanner:
         self.last_retry_info = None
         self.last_repair_info = None
         self.last_diagnostics = None
+        # ECCHP stage 1: plan identity across replanning windows. Only advanced
+        # when ``exec_repair.log_plan_events`` is on (candidate collection needs
+        # the same ids, so it enables them implicitly).
+        self._plan_events_on = bool(
+            self._research_on
+            and (
+                getattr(exec_cfg, "log_plan_events", False)
+                or getattr(exec_cfg, "collect_candidates", False)
+            )
+        )
+        self.plan_memory: Optional[PlanMemory] = None
+        self.last_plan_decision = None
+        # ECCHP stage 2: candidate set of the last decision (in-process only).
+        self.last_candidate_evidence = None
+        # Debug: last exception raised by the experimental repair branch.
+        self.last_repair_error = None
         # In-process execution context (may contain large tensors such as the
         # projected subgoal). Never serialised to JSONL.
         self.last_exec_context = None
@@ -136,12 +163,16 @@ class TwoLvlPlanner:
         repr_input: bool = False,
         mock_l1: bool = False,
         diff_loss_idx: Optional[torch.tensor] = None,
+        decision_step: Optional[int] = None,
     ):
         batch_size = current_state.shape[0]
         self.last_retry_info = None
         self.last_diagnostics = None
         self.last_exec_context = None
         self.last_repair_info = None
+        self.last_plan_decision = None
+        self.last_candidate_evidence = None
+        self.last_repair_error = None
 
         proprio_l1 = None
         if curr_proprio_pos is not None and curr_proprio_vel is not None:
@@ -194,7 +225,12 @@ class TwoLvlPlanner:
 
             gap_metrics = None
             objective = getattr(self.l1_planner, "objective", None)
-            if (self._diag_on or self._retry_on or self._repair_on) and objective is not None:
+            if (
+                self._diag_on
+                or self._retry_on
+                or self._repair_on
+                or self._plan_events_on
+            ) and objective is not None:
                 gap_metrics = cross_level_metrics(
                     l1_result.pred_obs,
                     l2_result.pred_obs,
@@ -257,6 +293,9 @@ class TwoLvlPlanner:
                     l1_result, l2_result, repair_info = repair_out
                     self.last_repair_info = repair_info
                     if repair_info is not None:
+                        self.last_candidate_evidence = getattr(
+                            repair_info, "candidate_evidence", None
+                        )
                         gap_metrics = cross_level_metrics(
                             l1_result.pred_obs,
                             l2_result.pred_obs,
@@ -290,7 +329,96 @@ class TwoLvlPlanner:
                 # ``subgoal_l2`` is a (B, D) tensor: keep it in-process only.
                 self.last_diagnostics = loggable_gap_metrics(diagnostics)
 
+            # ECCHP stage 1: attribute this decision to a persistent plan.
+            if self._plan_events_on:
+                self._note_plan_decision(
+                    batch_size=batch_size,
+                    gap_metrics=gap_metrics,
+                    step=decision_step,
+                )
+
         return TwoLvlPlanningResult(level1=l1_result, level2=l2_result)
+
+    # ------------------------------------------------------- plan-level events
+    def _note_plan_decision(
+        self,
+        *,
+        batch_size: int,
+        gap_metrics: Optional[dict],
+        step: Optional[int],
+    ) -> None:
+        """Advance the plan identity for every environment of this decision.
+
+        A *plan switch* is an accepted repair: both branches replace the route
+        the agent will follow (reselection replaces the L2 plan, projection
+        replaces the subgoal the L1 plan is executed towards).  An accepted
+        low-level retry changes the actions but not the route, so it keeps the
+        plan id and is recorded as its own source.
+        """
+        if self.plan_memory is None or self.plan_memory.n_envs != batch_size:
+            self.plan_memory = PlanMemory(
+                batch_size, task_id_offset=self.task_id_offset
+            )
+
+        def _accepted(info) -> torch.Tensor:
+            value = getattr(info, "accepted", None) if info is not None else None
+            if value is None:
+                return torch.zeros(batch_size, dtype=torch.bool)
+            return value.detach().cpu().to(dtype=torch.bool).view(-1)
+
+        repair_info = self.last_repair_info
+        retry_accepted = _accepted(self.last_retry_info)
+        repair_accepted = _accepted(repair_info)
+        if repair_accepted.numel() != batch_size:  # pragma: no cover - defensive
+            repair_accepted = torch.zeros(batch_size, dtype=torch.bool)
+        if retry_accepted.numel() != batch_size:  # pragma: no cover - defensive
+            retry_accepted = torch.zeros(batch_size, dtype=torch.bool)
+
+        repair_source = (
+            SOURCE_REPAIR_PROJECTION if self._projection_mode else SOURCE_REPAIR_RESElection
+        )
+        repair_reason = (
+            REASON_REPAIR_PROJECTION if self._projection_mode else REASON_REPAIR_RESElection
+        )
+
+        sources = []
+        reasons = []
+        for i in range(batch_size):
+            if bool(repair_accepted[i]):
+                sources.append(repair_source)
+                reasons.append(repair_reason)
+            elif bool(retry_accepted[i]):
+                sources.append(SOURCE_RETRY)
+                reasons.append(REASON_RETRY)
+            else:
+                sources.append(SOURCE_HWM)
+                reasons.append(REASON_KEEP)
+
+        metrics = gap_metrics or {}
+        n_candidates = 1
+        if repair_info is not None:
+            n_candidates = int(getattr(repair_info, "n_candidates", 0) or 0) + 1
+
+        decision_id = self.plan_memory.begin_decision()
+        records = self.plan_memory.update(
+            repair_accepted,
+            sources,
+            reasons,
+            step=0 if step is None else int(step),
+            n_candidates=n_candidates,
+            high_level_cost=getattr(repair_info, "high_level_cost_selected", None),
+            cross_mse=metrics.get("cross_mse"),
+            predicted_progress=metrics.get("pred_progress_h"),
+        )
+        self.last_plan_decision = {
+            "decision_id": decision_id,
+            "records": records,
+            "switched": repair_accepted.tolist(),
+            "plan_ids": [record.plan_id for record in records],
+            "previous_plan_ids": [record.previous_plan_id for record in records],
+            "sources": sources,
+            "reasons": reasons,
+        }
 
     def _maybe_retry(
         self,
@@ -391,9 +519,10 @@ class TwoLvlPlanner:
             )
             self._note_repair_accepted(None if info is None else info.accepted)
             return merged_l1, merged_l2, info
-        except Exception:
+        except Exception as exc:
             # The repair branch is experimental: a failure there must not take
             # down the episode. Re-raise only when explicitly debugging.
+            self.last_repair_error = repr(exc)
             if bool(getattr(self.exec_cfg, "repair_raise_errors", False)):
                 raise
             return l1_result, l2_result, None

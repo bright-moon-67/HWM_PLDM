@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -24,6 +25,13 @@ import torch
 from pldm.models.utils import flatten_conv_output
 
 ScalarLike = Union[int, float, bool, torch.Tensor]
+
+#: Event names introduced by ECCHP stage 1.  They are written to the same
+#: JSONL file as ``plan_gap`` / ``retry`` / ``repair`` and linked by the
+#: ``decision_id`` / ``plan_id`` pair.
+PLAN_DECISION_EVENT = "plan_decision"
+EXECUTION_OUTCOME_EVENT = "execution_outcome"
+PLAN_TRANSITION_EVENT = "plan_transition"
 
 
 def to_jsonable(value: Any) -> Any:
@@ -47,6 +55,119 @@ def to_jsonable(value: Any) -> Any:
     if hasattr(value, "tolist"):  # numpy scalars / arrays
         return to_jsonable(value.tolist())
     return str(value)
+
+
+def _py_float(value: Any) -> Optional[float]:
+    """Scalar -> python float, ``None`` when the value is missing/not scalar."""
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        return float(value.detach().double().item())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _py_xy(value: Any) -> Optional[List[float]]:
+    """``(..., 2)`` tensor / sequence -> ``[x, y]`` or ``None``."""
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        value = value.detach().cpu().reshape(-1).tolist()
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            return [float(value[0]), float(value[1])]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+@dataclass
+class ExecutionOutcomeRecord:
+    """What actually happened during one replanning window.
+
+    Connects back to :class:`pldm.planning.plan_memory.PlanDecision` through
+    ``decision_id``/``plan_id``, so a bad window can be attributed either to a
+    bad plan or to unstable execution of a plan that was otherwise fine.
+    """
+
+    task_id: int
+    env_index: int
+    step: int
+    decision_id: int
+    plan_id: int
+    start_xy: Optional[List[float]] = None
+    end_xy: Optional[List[float]] = None
+    predicted_xy: Optional[List[float]] = None
+    displacement: Optional[float] = None
+    predicted_displacement: Optional[float] = None
+    subgoal_dist_before: Optional[float] = None
+    subgoal_dist_after: Optional[float] = None
+    real_progress_h: Optional[float] = None
+    pred_progress_h: Optional[float] = None
+    execution_progress_gap: Optional[float] = None
+    exec_mse_obs: Optional[float] = None
+    exec_mse_xy: Optional[float] = None
+    route_path_length: Optional[float] = None
+    route_efficiency: Optional[float] = None
+    route_revisit_count: Optional[float] = None
+    stuck: Optional[bool] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": int(self.task_id),
+            "env_index": int(self.env_index),
+            "step": int(self.step),
+            "decision_id": int(self.decision_id),
+            "plan_id": int(self.plan_id),
+            "start_xy": _py_xy(self.start_xy),
+            "end_xy": _py_xy(self.end_xy),
+            "predicted_xy": _py_xy(self.predicted_xy),
+            "displacement": _py_float(self.displacement),
+            "predicted_displacement": _py_float(self.predicted_displacement),
+            "subgoal_dist_before": _py_float(self.subgoal_dist_before),
+            "subgoal_dist_after": _py_float(self.subgoal_dist_after),
+            "real_progress_h": _py_float(self.real_progress_h),
+            "pred_progress_h": _py_float(self.pred_progress_h),
+            "execution_progress_gap": _py_float(self.execution_progress_gap),
+            "exec_mse_obs": _py_float(self.exec_mse_obs),
+            "exec_mse_xy": _py_float(self.exec_mse_xy),
+            "route_path_length": _py_float(self.route_path_length),
+            "route_efficiency": _py_float(self.route_efficiency),
+            "route_revisit_count": _py_float(self.route_revisit_count),
+            "stuck": None if self.stuck is None else bool(self.stuck),
+        }
+
+
+@dataclass
+class PlanTransitionRecord:
+    """Start/end of a high-level plan inside the replanning timeline."""
+
+    task_id: int
+    env_index: int
+    step: int
+    decision_id: int
+    plan_id_before: int
+    plan_id_after: int
+    switched: bool
+    reason: str
+    plan_age_replans: int = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": int(self.task_id),
+            "env_index": int(self.env_index),
+            "step": int(self.step),
+            "decision_id": int(self.decision_id),
+            "plan_id_before": int(self.plan_id_before),
+            "plan_id_after": int(self.plan_id_after),
+            "switched": bool(self.switched),
+            "reason": str(self.reason),
+            "plan_age_replans": int(self.plan_age_replans),
+        }
 
 
 class DiagnosticsRecorder:
@@ -108,6 +229,11 @@ class DiagnosticsRecorder:
                 or getattr(cfg, "retry_enabled", False)
                 # A repair-only run still needs its events recorded.
                 or getattr(cfg, "repair_enabled", False)
+                # ECCHP stage 1: plan-level events are worth recording even
+                # when the per-window gap diagnostics are off.
+                or getattr(cfg, "log_plan_events", False)
+                # Stage-2 candidate collection also needs the event stream.
+                or getattr(cfg, "collect_candidates", False)
             )
         )
 
@@ -156,6 +282,48 @@ class DiagnosticsRecorder:
         handle = self._ensure_open()
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         handle.flush()
+
+    # --------------------------------------------------- plan-level events
+    def record_plan_decision(self, record: Any, *, step: Optional[int] = None) -> None:
+        """Append a ``plan_decision`` line for one environment.
+
+        ``record`` is a :class:`pldm.planning.plan_memory.PlanDecision` (typed
+        as ``Any`` to avoid an import cycle).
+        """
+        payload = record.as_dict() if hasattr(record, "as_dict") else dict(record)
+        self.record(
+            PLAN_DECISION_EVENT,
+            task_ids=[int(payload.get("task_id", 0))],
+            step=int(payload.get("step", 0) if step is None else step),
+            level="hier",
+            metrics=payload,
+        )
+
+    def record_execution_outcome(
+        self, record: Any, *, step: Optional[int] = None
+    ) -> None:
+        """Append an ``execution_outcome`` line for one environment."""
+        payload = record.as_dict() if hasattr(record, "as_dict") else dict(record)
+        self.record(
+            EXECUTION_OUTCOME_EVENT,
+            task_ids=[int(payload.get("task_id", 0))],
+            step=int(payload.get("step", 0) if step is None else step),
+            level="hier",
+            metrics=payload,
+        )
+
+    def record_plan_transition(
+        self, record: Any, *, step: Optional[int] = None
+    ) -> None:
+        """Append a ``plan_transition`` line for one environment."""
+        payload = record.as_dict() if hasattr(record, "as_dict") else dict(record)
+        self.record(
+            PLAN_TRANSITION_EVENT,
+            task_ids=[int(payload.get("task_id", 0))],
+            step=int(payload.get("step", 0) if step is None else step),
+            level="hier",
+            metrics=payload,
+        )
 
     def _ensure_open(self):
         if self._handle is not None:

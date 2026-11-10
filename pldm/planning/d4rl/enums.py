@@ -34,6 +34,31 @@ class ExecRepairConfig(ConfigBase):
     # Step 1/2: record cross-level disagreement and execution error diagnostics.
     log_diagnostics: bool = False
 
+    # ---- ECCHP stage 1: plan-level diagnostics ----
+    # Record one ``plan_decision`` / ``execution_outcome`` / ``plan_transition``
+    # line per environment and replanning window. This is purely observational:
+    # it must not change the executed actions, but it does cost extra L1->L2
+    # projections, so it has its own switch.
+    log_plan_events: bool = False
+    # Number of replanning windows used for the route indicators
+    # (``route_path_length`` / ``route_efficiency`` / ``route_revisit_count``).
+    route_history_window: int = 8
+    # A position counts as a revisit when the agent returns within this radius
+    # (metres) of an earlier position inside the window.
+    revisit_radius: float = 0.25
+
+    # ---- ECCHP stage 2: counterfactual candidate collection ----
+    # When on, every decision that runs the reselection branch also exposes its
+    # candidate set. The evaluator then replays every candidate from the *same*
+    # environment snapshot, continues with the normal HWM controller and records
+    # the realised graph-distance return (``candidate_outcome`` events).
+    # This is an expensive, offline-only measurement: it is never used online.
+    collect_candidates: bool = False
+    # Observation horizons for the counterfactual returns, in primitive steps.
+    candidate_horizons: str = "40,80"
+    # Cap on the number of decisions per chunk that are replayed (0 = no cap).
+    candidate_max_decisions: int = 0
+
     # Step 3: give the low-level MPPI planner a conditional second attempt.
     retry_enabled: bool = False
 
@@ -73,6 +98,13 @@ class ExecRepairConfig(ConfigBase):
     # Accept a repaired macro action only if it lowers the cross-level gap by
     # more than this amount.
     repair_min_improvement: float = 0.0
+    # ECCHP stage 0: keep the legacy "the terminal cross-level gap must
+    # improve" acceptance rule. Switching it off leaves only the feasibility
+    # gate and the combined score (J_H + lambda * C_L), which is what
+    # execution-calibrated switching needs: a detour that is temporarily
+    # further from the subgoal but long-term better must not be vetoed by the
+    # old rule. Default True preserves the historical behaviour.
+    repair_require_gap_improvement: bool = True
     # Cross-level gap above which the repair branch is allowed to fire. Kept
     # separate from ``retry_gap_threshold`` so E2 (retry) and E3/E4 (repair) use
     # their own budgets; 0 falls back to ``retry_gap_threshold``.
@@ -101,6 +133,9 @@ class ExecRepairConfig(ConfigBase):
     # Debug: compute repairs but drop them (must reproduce the baseline exactly;
     # used to verify RNG/warm-start isolation).
     repair_force_reject: bool = False
+    # Restore the CPU/CUDA RNG state when *no* environment accepted a repair, so
+    # that a rejected repair leaves later randomness untouched (stage 0).
+    repair_restore_rng_on_reject: bool = True
     # ... and does not make the cross-level gap worse by more than this.
     repair_gap_tolerance: float = 0.0
     # Re-raise exceptions from the experimental repair branch (debugging only).
